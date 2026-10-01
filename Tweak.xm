@@ -464,16 +464,28 @@ static void collectTargets(void) {
     } @catch (NSException *e) {}
     /* Zombie 包装扫描已移除：全球行动的敌人就是普通 Person，全量扫描 + 存活过滤即可 */
 }
+static BOOL gaWasRunning = NO;
+static long lastKillDiag = 0;
+static void killDiag(NSString *why, int ga, int running, int n) {
+    long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
+    if (now - lastKillDiag < 5000) return;
+    lastKillDiag = now;
+    TLog(@"[PVE] 🔎 杀怪诊断: %@（全球行动=%d 任务中=%d 目标数=%d）", why, ga, running, n);
+}
 static void killTick(void) {
     if (!cfg.autoKill) return;
     /* ★ 双重闸门：① 必须在全球行动关卡（控制器在）② 必须等任务正式开始（_running=1）
      *   少了 ② 会在准备阶段杀掉预置怪（不算分还扎眼）；少了 ① 会在别的模式乱杀人。 */
-    if (!ctrlInst()) return;
-    if (!tournamentRunning()) return;
+    void *ci = ctrlInst();
+    if (!ci) { killDiag(@"控制器实例=空(get_Instance未绑定/未进关卡)→杀怪+封顶全失效", 0, 0, 0); return; }
+    BOOL running = tournamentRunning();
+    if (running && !gaWasRunning) killedN = 0;     /* 新一局：清空击杀去重（防对象池复用旧指针导致"杀着杀着就停"） */
+    gaWasRunning = running;
+    if (!running) { killDiag(@"任务未开始(_running=0)", 1, 0, 0); return; }
     @try {
         collectTargets();
         if (targetsN == 0) { killedN = 0; return; }     /* 换局/场上清空 → 清掉旧标记 */
-        if (targetsN <= 3) return;                      /* 大厅/菜单不许开杀 */
+        if (targetsN <= 3) { killDiag(@"目标数≤3(疑似大厅/菜单 或 敌人不是Person类型)", 1, 1, targetsN); return; }  /* 大厅/菜单不许开杀 */
         int n = 0;
         for (int i = 0; i < targetsN && n < cfg.killPerTick; i++) {
             void *p = targets[i];
@@ -562,16 +574,24 @@ static void targetTick(void) {
     if (cfg.targetPoints <= 0) return;
     @try {
         void *inst = ctrlInst();
-        if (!inst) return;
-        int cur = *(int32_t *)((char *)inst + TIC_TARGET);
-        if (cur == cfg.targetPoints) return;
-        *(int32_t *)((char *)inst + TIC_TARGET) = cfg.targetPoints;
+        if (!inst) {
+            static long tCap = 0; long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
+            if (now - tCap > 8000) { tCap = now; TLog(@"[PVE] 🔎 封顶诊断: 控制器实例=空 → 封顶无法写入（get_Instance 未绑定或还没进全球行动关卡）"); }
+            return;
+        }
+        /* ★ 先无条件关掉 capBonus 叠加 —— 之前是「cur==目标分就跳过」，
+         *   若游戏默认目标分恰好=1000 会整拍跳过、永远不关 capBonus ⇒ 封顶=1000+capBonus≠1000。
+         *   现在每拍都先置 0，封顶必然等于 targetPoints。 */
         *(uint8_t *)((char *)inst + TIC_USECAP) = 0;
-        static long lastCapMsg = 0;
-        long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-        if (now - lastCapMsg > 5000) {
-            lastCapMsg = now;
-            TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加；被游戏重设会自动再写）", cur, cfg.targetPoints);
+        int cur = *(int32_t *)((char *)inst + TIC_TARGET);
+        if (cur != cfg.targetPoints) {
+            *(int32_t *)((char *)inst + TIC_TARGET) = cfg.targetPoints;
+            static long lastCapMsg = 0;
+            long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
+            if (now - lastCapMsg > 5000) {
+                lastCapMsg = now;
+                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加；被游戏重设会自动再写）", cur, cfg.targetPoints);
+            }
         }
     } @catch (NSException *e) {}
 }
@@ -776,6 +796,7 @@ static void setupStep(void) {
         TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 开火(ShootDown/Up)=%d/%d ForceTouch=%d/%d",
              mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0,
              mShootD ? 1 : 0, mShootU ? 1 : 0, mForceD ? 1 : 0, mForceU ? 1 : 0);
+        if (!mTicInst) TLog(@"[PVE] ⚠️ 全球行动控制器 get_Instance 未绑定！封顶/杀怪/刷怪 全部会失效（确认 IL2CPP 里 TournamentInGameController 存在且属性 getter 名为 get_Instance）");
         gTimer = [NSTimer timerWithTimeInterval:1.0 target:[ZBTimerTarget shared] selector:@selector(tick:) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
         TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜保护段=距满分%d分【按住连发】｜无限子弹=%d）"
