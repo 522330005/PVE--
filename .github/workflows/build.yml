@@ -1,0 +1,70 @@
+# =============================================================
+# GitHub Actions 编译 rootless deb  —  已验证 v5（TNGJB 成功）
+# 用法：放在 tweak 仓库的 .github/workflows/build.yml
+# 触发：push 到 main/master，或 Actions 页手动 Run workflow
+# 产物：Artifacts 里的 packages/*.deb（下载装手机）
+# =============================================================
+
+name: Build Rootless Deb
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (recursive, 拉齐 theos 子模块)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # ⚠️ theos 的 dm.pl 是 vendor 子模块，不 recursive 会 "requires dm.pl"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot unzip xz-utils perl rsync
+
+      - name: Clone theos (recursive)
+        run: |
+          git clone --depth=1 --recursive https://github.com/theos/theos.git theos
+
+      - name: Install iOS toolchain (L1ghtmann llvm-project, theos 官方同款)
+        run: |
+          # ⚠️ 2026-09 更新：theos-jailed 已改名 llvm-project，旧地址 releases 已空
+          #    theos 要求工具链必须在 $THEOS/toolchain/linux/iphone/bin/clang（写死路径，PATH 没用）
+          #    不同版本的 tar 包根布局不一样（有的根目录就是 bin/，有的带 linux/iphone 前缀）
+          #    ⇒ 解压后自动探测 bin/clang 在哪层，拷到 theos 要的固定位置
+          curl -LO https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+          rm -rf /tmp/tc && mkdir -p /tmp/tc
+          tar -xJf iOSToolchain-x86_64.tar.xz -C /tmp/tc
+          CLANG=$(find /tmp/tc -name clang | head -1)
+          echo "clang found at: $CLANG"
+          TCROOT=$(dirname "$(dirname "$CLANG")")     # bin 的上一层
+          mkdir -p $GITHUB_WORKSPACE/theos/toolchain/linux/iphone
+          cp -a $TCROOT/. $GITHUB_WORKSPACE/theos/toolchain/linux/iphone/
+          $GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/clang --version
+
+      - name: Install SDKs
+        run: |
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mkdir -p $GITHUB_WORKSPACE/theos/sdks
+          cp -r sdks-master/*.sdk $GITHUB_WORKSPACE/theos/sdks/ 2>/dev/null || true
+
+      - name: Build rootless deb
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          echo "THEOS=$THEOS"
+          export THEOS_PACKAGE_SCHEME=rootless
+          make package
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            **/packages/*.deb
+          if-no-files-found: error
