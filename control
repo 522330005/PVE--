@@ -1,0 +1,8 @@
+Package: com.sniper.pvega
+Name: SniperPVEGA
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Sniper3D PVE 全球行动 tweak (autohead.js native port: auto kill + score cap + spawn boost + last-shot guard)
+Maintainer: sniper
+Author: sniper
+Section: Tweaks
