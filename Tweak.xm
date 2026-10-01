@@ -1,20 +1,18 @@
 /* ============================================================================
- * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.38 模式2 的原生移植）
+ * SniperPVEZB — Sniper3D PVE【僵尸噩梦】tweak（autohead.js v8.38 的原生移植）
  * 注入方式：Dopamine 运行时注入（不动磁盘二进制，TNG 已验证的路线）
  *
- * 功能模块（对应 autohead.js 的模式 2 常驻项）：
- *   g  自动杀怪：每 tick_ms 杀 kill_per_tick 个，固定爆头（Person.Kill(true)）
- *       ★ 必须等 _running=1（任务正式开始）才动手 —— 准备阶段的预置怪杀了不算数还扎眼
- *   p  分数封顶：TournamentInGameController._targetPoints 恒定写目标分，并关 capBonus
- *       ⇒ 到分就结算，被游戏重设会自动再写（自愈）
- *   m  最后一发保护：距满分 ≤ guard_margin 分时持续模拟开火键
- *       （实测：满分瞬间若没真实弹道记录，终局 KillCam 空引用会秒退）
- *   w  刷怪加速：写【通用 TimedSpawner】的 间隔/总数/同屏上限（按类名分派偏移）
+ * 功能模块（对应 autohead.js 的模式 1 常驻项）：
+ *   g  自动杀怪：每 tick_ms 杀 kill_per_tick 个，固定爆头
+ *       僵尸用 HalloweenLiveEventPerson.TakeDamages(1e6, headshot, false)
+ *       （实测 Person.Kill 对池化僵尸无效 —— 这是踩过的坑）
+ *   c  连击注入：streakIndex 钉在配置表最高档（服务器按它查梯度表算加成）
+ *   w  刷怪加速：写刷怪器的 间隔/总数/同屏上限（按类名分派偏移，认不出就不写）
+ *   y  时长压缩：MatchTimer 压到目标秒数（走正常结束链，不硬跳）
  *   ∞  无限子弹：每把枪 currentAmmo 常驻写满 maxAmmo
- *   （连击注入已移除：全球行动没有连击加分，僵尸模式才有）
  *
- * 配置：沙盒 Documents/pvega_config.json（首次运行自动生成，改完 5 秒热重载）
- * 日志：沙盒 Documents/pvega_tweak.log（[LOADED] = 注入成功铁证）
+ * 配置：沙盒 Documents/pvezb_config.json（首次运行自动生成，改完 5 秒热重载）
+ * 日志：沙盒 Documents/pvezb_tweak.log（[LOADED] = 注入成功铁证）
  *
  * ⚠️ 沿用 SniperPVP 的血泪教训：
  *   - il2cpp API 只在**主线程**调用（后台 pthread 会撞 Unity 初始化窗口 →
@@ -40,25 +38,14 @@
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
-/* ★ 2026-10-01 用户指定：节奏 200ms、每秒杀 20 个、刷怪常年 20 只/秒、保护段距满分 250 分 */
-#define DEF_TICK_MS        200      /* 杀怪节奏：每 200ms 一拍 → 5 拍/秒 */
-#define DEF_KILL_PER_TICK  4        /* 每拍杀 4 个 ⇒ 5 × 4 = **每秒 20 个**（用户要的目标值） */
-#define DEF_SPAWN_RATE     20       /* 每秒刷 20 只（常驻 20） */
+#define DEF_TICK_MS        200      /* 杀怪节奏：每 200ms 一拍 */
+#define DEF_KILL_PER_TICK  5        /* 每拍杀 5 个 → 10 只/秒 */
+#define DEF_KILL_CAP       0        /* 0 = 不限（用户 2026-10-01 要求放开 300 上限） */
+#define DEF_STREAK_KILLS   300      /* 连击档位门槛（实际以运行时配置表为准） */
+#define DEF_SPAWN_RATE     13       /* 每秒刷 13 只 */
 #define DEF_SPAWN_LIMIT    20       /* 同屏上限（可自设） */
 #define DEF_SPAWN_TOTAL    0        /* 0 = 不限（内部用 500） */
-#define DEF_TARGET_POINTS  1000     /* 分数封顶 = 1000（OPS_TARGET_POINTS） */
-#define DEF_GUARD_MARGIN   250      /* 距满分还剩 250 分 → 进入保护段 */
-#define DEF_GUARD_FIRE_MS  120      /* 保护段【按住连发】：每 120ms 补一次"按下"（全程不松手） */
-
-/* 全球行动控制器 TournamentInGameController */
-#define TIC_RUNNING     0x40        /* _running：StartCounting() 置 1，Finish() 清 0 */
-#define TIC_TARGET      0x28        /* _targetPoints（封顶分） */
-#define TIC_POINTS      0x44        /* _points（实时分，不是右上角 UI） */
-#define TIC_CAPBONUS    0x50        /* _capBonus */
-#define TIC_USECAP      0x54        /* _useCapBonus（置 0 = 不叠加，封顶就等于 _targetPoints） */
-/* 开火键屏幕坐标（同 aim.js 实测值） */
-#define FIRE_POS_X      0.125
-#define FIRE_POS_Y      0.81
+#define DEF_TIME_LIMIT     20       /* 对局时长压缩到 20 秒 */
 
 /* 刷怪器：三个类的布局**不完全一样**（dump.cs 实证），认不出就绝不写 */
 #define SP_TOTAL_MIN  0x28
@@ -83,7 +70,17 @@
 #define MT_RUNNING       0x24      /* isTimerRunning (u8) */
 #define MT_SECONDS       0x20      /* matchTimeSeconds (float) */
 #define MT_LEFT          0x28      /* timeLeft (float) */
-/* 连击相关偏移已移除（全球行动无连击加分） */
+/* 计分器 / 连击（PlayerScoreCounter +0x20 = HeadshotStreakCounter） */
+#define SC_STREAK        0x20
+#define ST_CONFIG        0x10      /* streakConfig */
+#define ST_ONSTREAK      0x18      /* isOnStreak (u8) */
+#define ST_MULT          0x1C      /* streakMultiplier (float) */
+#define ST_INDEX         0x20      /* streakIndex (int) */
+#define ST_KILLS         0x24      /* streakKills (int) */
+#define ST_KILLS2        0x28
+/* 连击配置表 */
+#define CFG_NUMBERS      0x10      /* List<int> HeadshotNumber */
+#define CFG_MULTIPLIERS  0x18      /* List<float> StreakMultiplier */
 /* Person 存活位 */
 #define P_ALIVE  0x190
 #define P_DEAD   0x191
@@ -96,7 +93,7 @@
 /* ================= 日志 ================= */
 static NSLock *gLogLock = nil;
 static NSString *LogPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/pvega_tweak.log"];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/pvezb_tweak.log"];
 }
 static void TLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void TLog(NSString *fmt, ...) {
@@ -118,33 +115,33 @@ static void TLog(NSString *fmt, ...) {
     }
 }
 
-/* ================= 配置（Documents/pvega_config.json，5 秒热重载） ================= */
+/* ================= 配置（Documents/pvezb_config.json，5 秒热重载） ================= */
 typedef struct {
     BOOL   master;
     BOOL   autoKill;       /* g 自动杀怪 */
     int    tickMs;         /* 节奏 */
     int    killPerTick;    /* 每拍杀几个 */
+    int    killCap;        /* 击杀上限，0=不限 */
+    BOOL   streak;         /* c 连击注入 */
+    int    streakKills;    /* 配置表缺失时的兜底门槛 */
     BOOL   spawn;          /* w 刷怪加速 */
     int    spawnRate;      /* 每秒几只 */
     int    spawnLimit;     /* 同屏上限 */
     int    spawnTotal;     /* 总数，0=不限 */
-    int    targetPoints;   /* p 分数封顶（0 = 不干预，用游戏原封顶） */
-    BOOL   shotGuard;      /* m 最后一发保护（快满分时持续开火防秒退） */
-    int    guardMargin;    /* 距满分还剩多少分进入保护段 */
-    int    guardFireMs;    /* 保护段内多少毫秒点一次开火键 */
+    int    timeLimit;      /* y 时长压缩秒数，0=不干预 */
     BOOL   infiniteAmmo;   /* 无限子弹 */
-} GAConfig;
-static GAConfig cfg;
+} ZBConfig;
+static ZBConfig cfg;
 
 static NSString *ConfigPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/pvega_config.json"];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/pvezb_config.json"];
 }
-static void ConfigDefaults(GAConfig *c) {
+static void ConfigDefaults(ZBConfig *c) {
     c->master = YES;
-    c->autoKill = YES; c->tickMs = DEF_TICK_MS; c->killPerTick = DEF_KILL_PER_TICK;
+    c->autoKill = YES; c->tickMs = DEF_TICK_MS; c->killPerTick = DEF_KILL_PER_TICK; c->killCap = DEF_KILL_CAP;
+    c->streak = YES; c->streakKills = DEF_STREAK_KILLS;
     c->spawn = YES; c->spawnRate = DEF_SPAWN_RATE; c->spawnLimit = DEF_SPAWN_LIMIT; c->spawnTotal = DEF_SPAWN_TOTAL;
-    c->targetPoints = DEF_TARGET_POINTS;
-    c->shotGuard = YES; c->guardMargin = DEF_GUARD_MARGIN; c->guardFireMs = DEF_GUARD_FIRE_MS;
+    c->timeLimit = DEF_TIME_LIMIT;
     c->infiniteAmmo = YES;
 }
 static int cfgInt(NSDictionary *d, NSString *k, int def) {
@@ -157,24 +154,23 @@ static BOOL cfgBool(NSDictionary *d, NSString *k, BOOL def) {
     if (v && [v isKindOfClass:[NSNumber class]]) return [v boolValue];
     return def;
 }
-static void ConfigFromDict(GAConfig *c, NSDictionary *d) {
+static void ConfigFromDict(ZBConfig *c, NSDictionary *d) {
     c->master       = cfgBool(d, @"master", YES);
     c->autoKill     = cfgBool(d, @"auto_kill", YES);
     c->tickMs       = cfgInt(d, @"tick_ms", DEF_TICK_MS);
     c->killPerTick  = cfgInt(d, @"kill_per_tick", DEF_KILL_PER_TICK);
+    c->killCap      = cfgInt(d, @"kill_cap", DEF_KILL_CAP);
+    c->streak       = cfgBool(d, @"streak", YES);
+    c->streakKills  = cfgInt(d, @"streak_kills", DEF_STREAK_KILLS);
     c->spawn        = cfgBool(d, @"spawn", YES);
     c->spawnRate    = cfgInt(d, @"spawn_rate", DEF_SPAWN_RATE);
     c->spawnLimit   = cfgInt(d, @"spawn_limit", DEF_SPAWN_LIMIT);
     c->spawnTotal   = cfgInt(d, @"spawn_total", DEF_SPAWN_TOTAL);
-    c->targetPoints = cfgInt(d, @"target_points", DEF_TARGET_POINTS);
-    c->shotGuard    = cfgBool(d, @"shot_guard", YES);
-    c->guardMargin  = cfgInt(d, @"guard_margin", DEF_GUARD_MARGIN);
-    c->guardFireMs  = cfgInt(d, @"guard_fire_ms", DEF_GUARD_FIRE_MS);
+    c->timeLimit    = cfgInt(d, @"time_limit", DEF_TIME_LIMIT);
     c->infiniteAmmo = cfgBool(d, @"infinite_ammo", YES);
     if (c->tickMs < 30) c->tickMs = 30;          /* 太快会压死主线程 */
     if (c->killPerTick < 1) c->killPerTick = 1;
     if (c->spawnLimit < 1) c->spawnLimit = 1;
-    if (c->guardFireMs < 100) c->guardFireMs = 100;
 }
 static void WriteDefaultConfig(void) {
     NSString *body =
@@ -182,15 +178,15 @@ static void WriteDefaultConfig(void) {
         @"  \"master\": true,\n"
         @"  \"auto_kill\": true,\n"
         @"  \"tick_ms\": 200,\n"
-        @"  \"kill_per_tick\": 4,\n"
+        @"  \"kill_per_tick\": 5,\n"
+        @"  \"kill_cap\": 0,\n"
+        @"  \"streak\": true,\n"
+        @"  \"streak_kills\": 300,\n"
         @"  \"spawn\": true,\n"
-        @"  \"spawn_rate\": 20,\n"
+        @"  \"spawn_rate\": 13,\n"
         @"  \"spawn_limit\": 20,\n"
         @"  \"spawn_total\": 0,\n"
-        @"  \"target_points\": 1000,\n"
-        @"  \"shot_guard\": true,\n"
-        @"  \"guard_margin\": 250,\n"
-        @"  \"guard_fire_ms\": 120,\n"
+        @"  \"time_limit\": 20,\n"
         @"  \"infinite_ammo\": true\n"
         @"}\n";
     [body writeToFile:ConfigPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -253,13 +249,9 @@ static uintptr_t UFBase(void) {
 static void *ASMS = NULL;                    /* Assembly-CSharp image */
 static void *K_coreImg = NULL;               /* UnityEngine.CoreModule image */
 static void *K_object = NULL, *K_person = NULL, *K_shooter = NULL;
-/* 僵尸专属类已移除（K_halloween / K_zombie / K_hallPerson） */
-static void *K_tic = NULL;          /* TournamentInGameController（全球行动控制器） */
+static void *K_halloween = NULL, *K_zombie = NULL, *K_hallPerson = NULL;
 static void *K_spawnerH = NULL, *K_spawnerX = NULL, *K_spawnerG = NULL, *K_spawnerG5 = NULL;
-static void *mFOOAll = NULL, *mKill1 = NULL;   /* 僵尸专属方法已移除（mHallInst/mHallScore/mHallTD） */
-static void *mTicInst = NULL;       /* 全球行动静态单例 get_Instance */
-/* 开火（最后一发保护用）：走游戏自己的开火路径，换弹/弹药/冷却全部由游戏判断 */
-static void *mShootD = NULL, *mShootU = NULL, *mForceD = NULL, *mForceU = NULL;
+static void *mFOOAll = NULL, *mKill1 = NULL, *mHallInst = NULL, *mHallScore = NULL, *mHallTD = NULL;
 static void *tPerson = NULL, *tSpawnerH = NULL, *tSpawnerX = NULL, *tSpawnerG = NULL, *tSpawnerG5 = NULL;
 
 /* ★ 所有程序集都存下来（不只 Assembly-CSharp）：类的命名空间可能不在 Assembly-CSharp */
@@ -331,8 +323,9 @@ static BOOL setupAll(void) {
     K_object      = il2cpp_class_from_name(K_coreImg, "UnityEngine", "Object");
     K_person      = clsFrom("Person", "Person");
     K_shooter     = clsFrom("Player", "CharacterShooter");
-    K_tic         = clsFrom("", "TournamentInGameController");   /* 全球行动（命名空间兜底） */
-    /* 僵尸专属类不再绑定 */
+    K_halloween   = clsFrom("Game.HalloweenLiveEvent.Sniper3D", "HalloweenLiveEventLevelController");
+    K_zombie      = clsFrom("Game.HalloweenLiveEvent.Sniper3D", "Zombie");
+    K_hallPerson  = clsFrom("Game.HalloweenLiveEvent.Sniper3D", "HalloweenLiveEventPerson");
     K_spawnerH    = clsFrom("Game.HalloweenLiveEvent.Sniper3D", "HalloweenLiveEventTimedSpawner");
     K_spawnerX    = clsFrom("Game.ChristmasLiveEvent.Sniper3D", "ChristmasLiveEventTimedSpawner");
     K_spawnerG    = clsFrom("", "TimedSpawner");
@@ -340,13 +333,9 @@ static BOOL setupAll(void) {
     if (!K_object || !K_person) return NO;
     mFOOAll    = meth(K_object, "FindObjectsOfTypeAll", 1);
     mKill1     = meth(K_person, "Kill", 1);
-    /* 僵尸专属方法不再绑定 */
-    mTicInst   = meth(K_tic, "get_Instance", 0);
-    /* 开火入口（狙击是"松手开枪"：ShootUp 尾部才 TryNormalShoot ⇒ 必须成对调） */
-    mShootD    = meth(K_shooter, "ShootDown", 0);
-    mShootU    = meth(K_shooter, "ShootUp", 0);
-    mForceD    = meth(K_shooter, "ForceTouchShootDown", 0);
-    mForceU    = meth(K_shooter, "ForceTouchShootUp", 0);
+    mHallInst  = meth(K_halloween, "get_HalloweenInstance", 0);
+    mHallScore = meth(K_halloween, "get_PlayerScoreCounter", 0);
+    mHallTD    = meth(K_hallPerson, "TakeDamages", 3);
     tPerson    = typeObj(K_person);
     tSpawnerH  = typeObj(K_spawnerH);
     tSpawnerX  = typeObj(K_spawnerX);
@@ -378,45 +367,30 @@ static NSString *csStr(void *s) {
     if (l <= 0 || l > 200) return @"";
     return [[NSString alloc] initWithCharacters:(const unichar *)((char *)s + 0x14) length:(NSUInteger)l];
 }
-/* gDmg 已删：它只服务于僵尸的 TakeDamages(1e6,…)，全球行动用 Person.Kill(true)，不需要 double 参数 */
-static uint8_t gTrue = 1;      /* Person.Kill(true) 的 bool 参数（gFalse 已删：全球行动不用 TakeDamages） */
+static double *gDmg = NULL;      /* TakeDamages(1e6, …) 的 double 参数要传指针 */
+static uint8_t gTrue = 1, gFalse = 0;
 
 /* ================= 运行时状态 ================= */
 static BOOL gReady = NO;
+static void *hallInstCached = NULL;
+static long hallCacheAt = 0;
 static void *shooterInst = NULL;
 static long shooterFindAt = 0;
+static int  realKills = 0;
 static int  totalKilled = 0;
-static long lastKillAt = 0, lastSpawnAt = 0, lastTimeAt = 0, lastBeatAt = 0;
+static long lastKillAt = 0, lastSpawnAt = 0, lastStreakAt = 0, lastTimeAt = 0, lastBeatAt = 0;
 static long frames = 0;
-static BOOL inHallLogged = NO;    /* "进入全球行动关卡"只报一次 */
+static BOOL inHallLogged = NO;    /* "进入僵尸关卡"只报一次 */
+static long hallNullSince = 0;    /* 在僵尸关=0 持续计时（用于提示是否真在关卡内） */
 static BOOL spawnLogged = NO;     /* "刷怪加速生效"只报一次（别和上面共用同一个标志） */
-/* 注：僵尸专属的 hallInst / 本局人头 / realKills 已全部移除 */
-/* 全球行动控制器（同拍缓存，别每拍都 invoke） */
-static void *ctrlInstCached = NULL;
-static long ctrlCacheAt = 0;
-static void *ctrlInst(void) {
+static BOOL capReached = NO;
+
+static void *hallInst(void) {
     long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-    if (ctrlInstCached && now - ctrlCacheAt < 400) return ctrlInstCached;
-    ctrlInstCached = inv(mTicInst, NULL, NULL, 0);
-    ctrlCacheAt = now;
-    return ctrlInstCached;
-}
-/* ★ v8.11：任务是否正式开始。准备阶段场上就有预置怪，提前杀不算数还扎眼 */
-static BOOL tournamentRunning(void) {
-    void *inst = ctrlInst();
-    if (!inst) return NO;
-    @try { return *(uint8_t *)((char *)inst + TIC_RUNNING) != 0; } @catch (NSException *e) { return NO; }
-}
-/* 已击杀名单（同一对象只杀一次；换局自动清空）—— 全球行动专用 */
-static void *killedList[512];
-static int killedN = 0;
-static BOOL killedSeen(void *p) {
-    for (int i = 0; i < killedN; i++) if (killedList[i] == p) return YES;
-    return NO;
-}
-static void killedPush(void *p) {
-    if (killedN >= 512) killedN = 0;         /* 满了就整轮重置（相当于换局） */
-    killedList[killedN++] = p;
+    if (hallInstCached && now - hallCacheAt < 400) return hallInstCached;
+    hallInstCached = inv(mHallInst, NULL, NULL, 0);
+    hallCacheAt = now;
+    return hallInstCached;
 }
 static void *findShooter(void) {
     @try {
@@ -432,7 +406,18 @@ static void *findShooter(void) {
     } @catch (NSException *e) {}
     return NULL;
 }
-/* 本局人头（僵尸专属）已移除：全球行动不需要 */
+/* 本局人头 = KilledZombieStorage 明细条数（控制器+0x350 → List@+0x18 → _size@+0x18） */
+static int getZombiesKilled(void) {
+    @try {
+        void *inst = hallInst();
+        if (!inst) return -1;
+        void *st = *(void **)((char *)inst + HALL_STORAGE);
+        if (!st) return -1;
+        void *list = *(void **)((char *)st + 0x18);
+        if (!list) return -1;
+        return *(int32_t *)((char *)list + 0x18);
+    } @catch (NSException *e) { return -1; }
+}
 
 /* ================= g：自动杀怪 ================= */
 #define MAX_TARGETS 400
@@ -462,46 +447,114 @@ static void collectTargets(void) {
             }
         }
     } @catch (NSException *e) {}
-    /* Zombie 包装扫描已移除：全球行动的敌人就是普通 Person，全量扫描 + 存活过滤即可 */
-}
-static BOOL gaWasRunning = NO;
-static long lastKillDiag = 0;
-static void killDiag(NSString *why, int ga, int running, int n) {
-    long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-    if (now - lastKillDiag < 5000) return;
-    lastKillDiag = now;
-    TLog(@"[PVE] 🔎 杀怪诊断: %@（全球行动=%d 任务中=%d 目标数=%d）", why, ga, running, n);
+    /* 僵尸噩梦：从 Zombie 包装类反向收集（+0x20 = person），
+     * 池化僵尸的 Person._alive 未必按普通怪置位 —— 这是"杀不到"的老根因 */
+    @try {
+        void *t = typeObj(K_zombie);
+        if (t) {
+            void *r = inv(mFOOAll, NULL, (void *[]){ t }, 1);
+            if (r) {
+                int n = *(int32_t *)((char *)r + 0x18);
+                for (int i = 0; i < n && targetsN < MAX_TARGETS; i++) {
+                    void *z = *(void **)((char *)r + 0x20 + 8 * i);
+                    if (!z) continue;
+                    void *p = *(void **)((char *)z + 0x20);
+                    if (p && !targetSeen(p)) targets[targetsN++] = p;   /* 绕过存活过滤 + 去重 */
+                }
+            }
+        }
+    } @catch (NSException *e) {}
 }
 static void killTick(void) {
     if (!cfg.autoKill) return;
-    /* ★ 双重闸门：① 必须在全球行动关卡（控制器在）② 必须等任务正式开始（_running=1）
-     *   少了 ② 会在准备阶段杀掉预置怪（不算分还扎眼）；少了 ① 会在别的模式乱杀人。 */
-    void *ci = ctrlInst();
-    if (!ci) { killDiag(@"控制器实例=空(get_Instance未绑定/未进关卡)→杀怪+封顶全失效", 0, 0, 0); return; }
-    BOOL running = tournamentRunning();
-    if (running && !gaWasRunning) killedN = 0;     /* 新一局：清空击杀去重（防对象池复用旧指针导致"杀着杀着就停"） */
-    gaWasRunning = running;
-    if (!running) { killDiag(@"任务未开始(_running=0)", 1, 0, 0); return; }
+    void *inst = hallInst();
+    BOOL hallMode = (inst != NULL);
+    /* ★★ 必须锁死：只有在**僵尸噩梦关卡**才动杀手。
+     *   否则非僵尸关（普通关 / PVP）会走 Person.Kill(true) 分支 ——
+     *   那会把场上的人一个个杀掉（PVP 里就是真人玩家），属于灾难级副作用。 */
+    if (!hallMode) return;
     @try {
+        int zk = getZombiesKilled();
+        if (zk >= 0) realKills = zk;
+        if (cfg.killCap > 0 && zk >= cfg.killCap) {
+            if (!capReached) {
+                capReached = YES;
+                TLog(@"[PVE] 击杀 %d/%d 已达上限，停止杀怪", zk, cfg.killCap);
+            }
+            return;
+        }
+        capReached = NO;
         collectTargets();
-        if (targetsN == 0) { killedN = 0; return; }     /* 换局/场上清空 → 清掉旧标记 */
-        if (targetsN <= 3) { killDiag(@"目标数≤3(疑似大厅/菜单 或 敌人不是Person类型)", 1, 1, targetsN); return; }  /* 大厅/菜单不许开杀 */
+        if (targetsN <= 3) return;          /* 大厅/菜单不许开杀 */
+        if (!gDmg) gDmg = (double *)malloc(8);   /* ⚠️ .xm 按 ObjC++ 编译，void* 不会隐式转 double* */
+        *gDmg = 1e6;
         int n = 0;
         for (int i = 0; i < targetsN && n < cfg.killPerTick; i++) {
             void *p = targets[i];
             if (!p) continue;
-            if (killedSeen(p)) continue;                /* 同一对象只杀一次 */
-            killedPush(p);
             @try {
-                inv(mKill1, p, (void *[]){ &gTrue }, 1);   /* Person.Kill(headshot=true) */
+                if (hallMode && mHallTD) {
+                    inv(mHallTD, p, (void *[]){ gDmg, &gTrue, &gFalse }, 3);   /* TakeDamages(1e6, headshot=true, false) */
+                } else {
+                    inv(mKill1, p, (void *[]){ &gTrue }, 1);                    /* Kill(true) */
+                }
                 n++; totalKilled++;
             } @catch (NSException *e) {}
         }
     } @catch (NSException *e) {}
 }
 
-/* 连击注入：2026-10-01 用户要求移除 —— 全球行动没有连击加分，僵尸那份才有。
- * （顺带说明：autohead.js 里它本来就只认僵尸控制器，全球行动无论开关都是空转） */
+/* ================= c：连击注入 ================= */
+static void streakTick(void) {
+    if (!cfg.streak) return;
+    @try {
+        void *inst = hallInst();
+        if (!inst || !mHallScore) return;
+        void *sc = inv(mHallScore, inst, NULL, 0);
+        if (!sc) return;
+        void *st = *(void **)((char *)sc + SC_STREAK);
+        if (!st) return;
+        if (!gDmg) gDmg = (double *)malloc(8);   /* ⚠️ .xm 按 ObjC++ 编译，void* 不会隐式转 double* */
+        /* 先读后写：已经钉在顶格就整段跳过（游戏自己也在动这些字段） */
+        void *cfgO = *(void **)((char *)st + ST_CONFIG);
+        if (cfgO) {
+            void *ml = *(void **)((char *)cfgO + CFG_MULTIPLIERS);   /* List<float> */
+            if (ml) {
+                int mSize = *(int32_t *)((char *)ml + 0x18);
+                void *mArr = *(void **)((char *)ml + 0x10);
+                if (mSize > 0 && mArr) {
+                    int last = mSize - 1;
+                    float topMult = *(float *)((char *)mArr + 0x20 + 4 * last);
+                    int need = cfg.streakKills;
+                    void *nl = *(void **)((char *)cfgO + CFG_NUMBERS);   /* List<int> */
+                    if (nl) {
+                        int nSize = *(int32_t *)((char *)nl + 0x18);
+                        void *nArr = *(void **)((char *)nl + 0x10);
+                        if (nSize > 0 && nArr) need = *(int32_t *)((char *)nArr + 0x20 + 4 * last);
+                    }
+                    BOOL already = (*(uint8_t *)((char *)st + ST_ONSTREAK) == 1)
+                                && (*(int32_t *)((char *)st + ST_INDEX) == last)
+                                && (fabsf(*(float *)((char *)st + ST_MULT) - topMult) < 0.01f)
+                                && (*(int32_t *)((char *)st + ST_KILLS) == need)
+                                && (*(int32_t *)((char *)st + ST_KILLS2) == need);
+                    if (already) return;
+                    *(uint8_t *)((char *)st + ST_ONSTREAK) = 1;
+                    *(int32_t *)((char *)st + ST_INDEX) = last;
+                    *(float *)((char *)st + ST_MULT) = topMult;
+                    *(int32_t *)((char *)st + ST_KILLS) = need;
+                    *(int32_t *)((char *)st + ST_KILLS2) = need;
+                    return;
+                }
+            }
+        }
+        /* 配置表缺失的兜底 */
+        *(uint8_t *)((char *)st + ST_ONSTREAK) = 1;
+        *(int32_t *)((char *)st + ST_INDEX) = 4;
+        *(int32_t *)((char *)st + ST_KILLS) = cfg.streakKills;
+        *(int32_t *)((char *)st + ST_KILLS2) = cfg.streakKills;
+        *(float *)((char *)st + ST_MULT) = 5.0f;
+    } @catch (NSException *e) {}
+}
 
 /* ================= w：刷怪加速（按类名分派偏移） ================= */
 typedef struct { int cur, run, left; const char *tag; } SpSpec;
@@ -515,7 +568,15 @@ static BOOL specOf(void *cls, SpSpec *out) {
 }
 static void spawnTick(void) {
     if (!cfg.spawn || cfg.spawnRate <= 0) return;
-    if (!ctrlInst()) return;      /* ★ 只在全球行动关卡动手，别去改别的模式的刷怪器 */
+    void *hi = hallInst();
+    if (!hi) {     /* 不在僵尸关：仍输出诊断，否则整段静默、看不出卡哪一环 */
+        static long lastSD0 = 0; long nd = (long)(CFAbsoluteTimeGetCurrent() * 1000);
+        if (nd - lastSD0 > 10000) { lastSD0 = nd;
+            TLog(@"[PVE] 🔎 刷怪诊断: 在僵尸关=0（get_HalloweenInstance 返回空）刷怪器实例=0 运行中=0 已改写=0（spawn=%d rate=%d）",
+                 cfg.spawn ? 1 : 0, cfg.spawnRate);
+        }
+        return;      /* ★ 只在僵尸关动手，别去改别的模式的刷怪器 */
+    }
     @try {
         float itv = 1.0f / (float)cfg.spawnRate;
         int total = cfg.spawnTotal > 0 ? cfg.spawnTotal : 500;
@@ -553,7 +614,7 @@ static void spawnTick(void) {
                  cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 0, hit);
         }
         /* ★ 刷怪诊断（10 秒一条）：四段数字能一次定位卡在哪一环
-         *   全球行动=0  → ctrlInst() 拿不到（控制器类/方法没找到）⇒ 全部功能哑火
+         *   在僵尸关=0  → hallInst() 拿不到（控制器类/方法没找到）⇒ 全部功能哑火
          *   实例=0      → 刷怪器类没找到，或当前不在可刷怪的关卡
          *   运行中=0    → _running 偏移不对，或波次还没开始
          *   已改写=0 但运行中>0 → spec 匹配失败（实例是子类，klass 比对不上） */
@@ -561,95 +622,26 @@ static void spawnTick(void) {
         long nowD = (long)(CFAbsoluteTimeGetCurrent() * 1000);
         if (nowD - lastSpawnDiag > 10000) {
             lastSpawnDiag = nowD;
-            TLog(@"[PVE] 🔎 刷怪诊断: 全球行动=%d 刷怪器实例=%d 运行中=%d 已改写=%d（spawn=%d rate=%d）",
-                 ctrlInst() ? 1 : 0, foundN, runningN, hit, cfg.spawn ? 1 : 0, cfg.spawnRate);
+            TLog(@"[PVE] 🔎 刷怪诊断: 在僵尸关=%d 刷怪器实例=%d 运行中=%d 已改写=%d（spawn=%d rate=%d）",
+                 hallInst() ? 1 : 0, foundN, runningN, hit, cfg.spawn ? 1 : 0, cfg.spawnRate);
         }
     } @catch (NSException *e) {}
 }
 
-/* ================= p：分数封顶（恒定自愈写） =================
- * 结束判定：_points(+0x44) >= _targetPoints(+0x28) + (_useCapBonus(+0x54) ? _capBonus(+0x50) : 0)
- * ⇒ 把 _useCapBonus 置 0，封顶就等于 _targetPoints 本身；被游戏重设会自动再写。 */
-static void targetTick(void) {
-    if (cfg.targetPoints <= 0) return;
+/* ================= y：对局时长压缩 ================= */
+static void timeTick(void) {
+    if (cfg.timeLimit <= 0) return;
     @try {
-        void *inst = ctrlInst();
-        if (!inst) {
-            static long tCap = 0; long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-            if (now - tCap > 8000) { tCap = now; TLog(@"[PVE] 🔎 封顶诊断: 控制器实例=空 → 封顶无法写入（get_Instance 未绑定或还没进全球行动关卡）"); }
-            return;
-        }
-        /* ★ 先无条件关掉 capBonus 叠加 —— 之前是「cur==目标分就跳过」，
-         *   若游戏默认目标分恰好=1000 会整拍跳过、永远不关 capBonus ⇒ 封顶=1000+capBonus≠1000。
-         *   现在每拍都先置 0，封顶必然等于 targetPoints。 */
-        *(uint8_t *)((char *)inst + TIC_USECAP) = 0;
-        int cur = *(int32_t *)((char *)inst + TIC_TARGET);
-        if (cur != cfg.targetPoints) {
-            *(int32_t *)((char *)inst + TIC_TARGET) = cfg.targetPoints;
-            static long lastCapMsg = 0;
-            long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-            if (now - lastCapMsg > 5000) {
-                lastCapMsg = now;
-                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加；被游戏重设会自动再写）", cur, cfg.targetPoints);
-            }
-        }
-    } @catch (NSException *e) {}
-}
-
-/* ================= m：最后一发保护（快满分 → 持续开火，防终局秒退） =================
- * 诊断结论（2026-09-21 用户 A/B 实测）：满分瞬间若人物全程没有"射击状态"的真实弹道，
- * 终局 KillCam / HighlightKiller 无可回放的开枪记录 → 空引用秒退。
- * ⇒ 距满分 ≤ guard_margin 分时按 guard_fire_ms 的节奏扣扳机（走游戏自己的开火路径）。 */
-/* ★ 2026-10-01 用户要求：保护段改成【按住连发】—— 按下就不松手，由游戏按自己的射速连发。
- *   - 进入保护段：调 ShootDown（按下），**不再调 ShootUp**
- *   - 保持期间：每 guard_fire_ms 补一次 ShootDown（半自动武器靠这个才能连发，自动武器补按也无害）
- *   - 离开保护段 / 对局结束 / 开关关闭：调 ShootUp 松手，保证状态干净
- *   ⚠️ 狙击是"松手开枪"（ShootUp 尾部才 TryNormalShoot），所以离开时必须补一次 ShootUp。 */
-static BOOL guardOn = NO, guardLogged = NO, holding = NO;
-static long lastGuardAt = 0;
-static int  realShots = 0;
-static void pressDown(void) {
-    @try {
-        if (!shooterInst) return;
-        if (mShootD) inv(mShootD, shooterInst, NULL, 0);   /* 正常扳机：按下 */
-        if (mForceD) inv(mForceD, shooterInst, NULL, 0);   /* 双保险 */
-        realShots++;
-    } @catch (NSException *e) {}
-}
-static void releaseUp(void) {
-    @try {
-        if (!shooterInst) return;
-        if (mShootU) inv(mShootU, shooterInst, NULL, 0);   /* 松手 */
-        if (mForceU) inv(mForceU, shooterInst, NULL, 0);
-    } @catch (NSException *e) {}
-}
-static void guardTick(void) {
-    if (!cfg.shotGuard) {
-        if (holding) { releaseUp(); holding = NO; }        /* 关掉开关也要松手 */
-        guardOn = NO;
-        return;
-    }
-    @try {
-        void *inst = ctrlInst();
-        if (!inst || !*(uint8_t *)((char *)inst + TIC_RUNNING)) {
-            if (holding) { releaseUp(); holding = NO; }    /* 对局结束 → 松手 */
-            guardOn = NO;
-            return;
-        }
-        int pts = *(int32_t *)((char *)inst + TIC_POINTS);      /* 实时分（不是右上角 UI） */
-        int eff = *(int32_t *)((char *)inst + TIC_TARGET);      /* 已关 capBonus ⇒ 封顶就是它 */
-        if (pts >= eff - cfg.guardMargin) {
-            guardOn = YES;
-            if (!guardLogged) {
-                guardLogged = YES;
-                TLog(@"[PVE] 持续开火: 进入保护段（%d/%d）→ 【按住连发】每 %dms 补一次按下", pts, eff, cfg.guardFireMs);
-            }
-            long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-            if (now - lastGuardAt >= cfg.guardFireMs) { lastGuardAt = now; pressDown(); holding = YES; }
-        } else if (guardOn) {
-            guardOn = NO; guardLogged = NO;
-            if (holding) { releaseUp(); holding = NO; }    /* ★ 离开时松手 */
-            TLog(@"[PVE] 持续开火: 离开保护段（新对局/分数回退）→ 已松手");
+        void *inst = hallInst();
+        if (!inst) return;
+        void *tm = *(void **)((char *)inst + HALL_MATCHTIMER);
+        if (!tm) return;
+        if (!*(uint8_t *)((char *)tm + MT_RUNNING)) return;      /* 计时未运行 */
+        float left = *(float *)((char *)tm + MT_LEFT);
+        if (left > (float)cfg.timeLimit) {
+            *(float *)((char *)tm + MT_SECONDS) = (float)cfg.timeLimit;
+            *(float *)((char *)tm + MT_LEFT) = (float)cfg.timeLimit;
+            TLog(@"[PVE] 对局时长已压缩为 %d 秒", cfg.timeLimit);
         }
     } @catch (NSException *e) {}
 }
@@ -680,34 +672,38 @@ static void frame(void) {
         frames++;
         long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
         if (!gReady) return;
-        /* ★ master 总开关：运行中热改成 false 也要**立刻全部停手** ——
-         *   尤其"按住连发"必须先松手，否则会一直扣着扳机不放（这个 bug 只有热重载才会暴露）。 */
-        if (!cfg.master) {
-            if (holding) { releaseUp(); holding = NO; }
-            guardOn = NO;
-            return;
-        }
+        /* ★ master 总开关：运行中热改成 false 也要立刻全部停手（原来只在启动那一次检查，
+         *   热重载改 false 后功能照样在跑 —— 和全球行动那份同一个坑，一起修）。 */
+        if (!cfg.master) return;
 
         if (!shooterInst || now - shooterFindAt > 5000) { shooterInst = findShooter(); shooterFindAt = now; }
         refillAmmo();
 
-        void *inst = ctrlInst();
-        if (inst && !inHallLogged) {
-            inHallLogged = YES;
-            TLog(@"[PVE] 进入全球行动关卡 → 常驻功能全部生效");
+        void *inst = hallInst();
+        if (inst) {
+            if (!inHallLogged) {
+                inHallLogged = YES;
+                TLog(@"[PVE] 进入僵尸噩梦关卡 → 常驻功能全部生效");
+            }
+            hallNullSince = 0;
+        } else {
+            if (inHallLogged) { inHallLogged = NO; TLog(@"[PVE] 离开僵尸噩梦关卡"); }
+            if (hallNullSince == 0) hallNullSince = now;
+            else if (now - hallNullSince > 30000) {
+                hallNullSince = now;
+                TLog(@"[PVE] 🔎 在僵尸关=0 已持续≥30s（帧=%ld）：若你此刻确实在【僵尸噩梦/Halloween Live Event】关卡内，说明 get_HalloweenInstance 返回空（事件未激活 或 不是该模式）；若只是在菜单/其它模式则属正常", frames);
+            }
         }
         if (now - lastKillAt >= cfg.tickMs)   { lastKillAt = now; killTick(); }
-        /* 连击注入已移除 */
+        if (now - lastStreakAt >= 250)        { lastStreakAt = now; streakTick(); }
         if (now - lastSpawnAt >= 500)         { lastSpawnAt = now; spawnTick(); }
-        if (now - lastTimeAt >= 1000)         { lastTimeAt = now; targetTick(); }   /* 封顶自愈 */
-        guardTick();                                                              /* 保护段开火 */
+        if (now - lastTimeAt >= 1000)         { lastTimeAt = now; timeTick(); }
 
         if (now - lastBeatAt > 10000) {
             lastBeatAt = now;
-            TLog(@"[PVE] 心跳 帧=%ld 全球行动=%d 任务中=%d 累计击杀=%d 刷怪=%d只/秒 封顶=%d 保护段=%d(按住中=%d) 触发次数=%d 无限子弹=%d",
-                 frames, inst ? 1 : 0, tournamentRunning() ? 1 : 0, totalKilled,
-                 cfg.spawn ? cfg.spawnRate : 0, cfg.targetPoints, guardOn ? 1 : 0,
-                 holding ? 1 : 0, realShots, cfg.infiniteAmmo ? 1 : 0);
+            TLog(@"[PVE] 心跳 帧=%ld 在僵尸关=%d 本局人头=%d 累计击杀=%d 刷怪=%d只/秒 时长=%ds 连击=%d 无限子弹=%d",
+                 frames, inst ? 1 : 0, realKills, totalKilled,
+                 cfg.spawn ? cfg.spawnRate : 0, cfg.timeLimit, cfg.streak ? 1 : 0, cfg.infiniteAmmo ? 1 : 0);
         }
     } @catch (NSException *e) { TLog(@"[PVE] frame 异常: %@", e); }
 }
@@ -741,15 +737,11 @@ static void tick1s(NSTimer *t) {
             }
         }
         if (!gReady) return;
-        if (!cfg.master) {                       /* ★ 同上：master 关了就别写封顶/别刷怪 */
-            if (holding) { releaseUp(); holding = NO; }
-            guardOn = NO;
-            return;
-        }
+        if (!cfg.master) return;      /* ★ 同上：master 关了就别刷怪/别压时长 */
         if (!shooterInst) shooterInst = findShooter();
         refillAmmo();
         spawnTick();
-        targetTick();
+        timeTick();
     } @catch (NSException *e) {}
 }
 @interface ZBTimerTarget : NSObject
@@ -790,21 +782,18 @@ static void setupStep(void) {
             return;
         }
         /* ★ 绑定结果自检：哪一项是 0，就是那一环没找到（刷怪不生效先看这里） */
-        TLog(@"[PVE] 🔎 类绑定: Person=%d 射手=%d 全球控制器=%d ｜刷怪器 僵尸=%d 圣诞=%d 通用=%d 500=%d",
-             K_person ? 1 : 0, K_shooter ? 1 : 0, K_tic ? 1 : 0,
+        TLog(@"[PVE] 🔎 类绑定: Person=%d 射手=%d 僵尸控制器=%d Zombie=%d 僵尸本体=%d ｜刷怪器 僵尸=%d 圣诞=%d 通用=%d 500=%d",
+             K_person ? 1 : 0, K_shooter ? 1 : 0, K_halloween ? 1 : 0, K_zombie ? 1 : 0, K_hallPerson ? 1 : 0,
              K_spawnerH ? 1 : 0, K_spawnerX ? 1 : 0, K_spawnerG ? 1 : 0, K_spawnerG5 ? 1 : 0);
-        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 开火(ShootDown/Up)=%d/%d ForceTouch=%d/%d",
-             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0,
-             mShootD ? 1 : 0, mShootU ? 1 : 0, mForceD ? 1 : 0, mForceU ? 1 : 0);
-        if (!mTicInst) TLog(@"[PVE] ⚠️ 全球行动控制器 get_Instance 未绑定！封顶/杀怪/刷怪 全部会失效（确认 IL2CPP 里 TournamentInGameController 存在且属性 getter 名为 get_Instance）");
+        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 僵尸单例=%d 计分器=%d 伤害入口=%d",
+             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mHallInst ? 1 : 0, mHallScore ? 1 : 0, mHallTD ? 1 : 0);
         gTimer = [NSTimer timerWithTimeInterval:1.0 target:[ZBTimerTarget shared] selector:@selector(tick:) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
-        TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜保护段=距满分%d分【按住连发】｜无限子弹=%d）"
-             @" —— 日志: Documents/pvega_tweak.log",
-             TWEAK_VERSION, cfg.autoKill ? 1 : 0, cfg.tickMs, cfg.killPerTick,
-             (double)1000.0 / (double)cfg.tickMs * (double)cfg.killPerTick,
-             cfg.spawn ? cfg.spawnRate : 0, cfg.spawnLimit, cfg.spawnTotal,
-             cfg.targetPoints, cfg.guardMargin, cfg.infiniteAmmo ? 1 : 0);
+        TLog(@"[PVE] 🎯 SniperPVEZB v%s 就绪（杀怪=%d 每%dms×%d个 上限%d｜连击=%d｜刷怪=%d只/秒 同屏%d 总数%d｜时长=%ds｜无限子弹=%d）"
+             @" —— 日志: Documents/pvezb_tweak.log",
+             TWEAK_VERSION, cfg.autoKill ? 1 : 0, cfg.tickMs, cfg.killPerTick, cfg.killCap,
+             cfg.streak ? 1 : 0, cfg.spawn ? cfg.spawnRate : 0, cfg.spawnLimit, cfg.spawnTotal,
+             cfg.timeLimit, cfg.infiniteAmmo ? 1 : 0);
     } @catch (NSException *e) { TLog(@"[PVE] 启动异常: %@", e); retrySetup(); }
 }
 
@@ -818,7 +807,7 @@ static void setupStep(void) {
                 NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
                 if (![bid isEqualToString:@BUNDLE_SNIPER3D]) { TLog(@"[PVE] 非 Sniper3D（%@）→ 不启用", bid); return; }
                 if (!cfg.master) { TLog(@"[PVE] master=false → 本轮不启用（改成 true 才工作；此刻不碰 il2cpp）"); return; }
-                TLog(@"[PVE] [LOADED] target=%@ v%s（SniperPVEGA）", bid, TWEAK_VERSION);
+                TLog(@"[PVE] [LOADED] target=%@ v%s（SniperPVEZB）", bid, TWEAK_VERSION);
                 setupStep();
             } @catch (NSException *e) {}
         }
