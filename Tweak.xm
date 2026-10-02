@@ -71,7 +71,7 @@
 #include <stdlib.h>      /* malloc / calloc */
 #include <sys/stat.h>    /* 配置热重载：stat() 取文件修改时间 */
 
-#define TWEAK_VERSION "0.3.1"
+#define TWEAK_VERSION "0.3.2"
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
@@ -177,6 +177,7 @@ typedef struct {
     float  equipBonus;     /* 装备/联赛得分加成倍数（1.0=不改；2.0=提交分×2；作用于 ReportLevelResult 的 scoreDelta） */
     BOOL   equipHook;      /* ★ v0.3.1：是否安装 ReportLevelResult 钩子（默认关；v0.3.0 该 MSHook 涉嫌结算闪退） */
     BOOL   noKillCam;      /* ★ v0.3.1：安全结算（拦截 ShowKillCam，复刻 FakeKillCam 延迟结算） */
+    BOOL   spawnMulti;     /* ★ v0.3.2：是否改写全部运行中的刷怪器（默认关=只写第一个；全部都写=40只/秒 会引擎 SIGABRT） */
 } GAConfig;
 static GAConfig cfg;
 
@@ -192,6 +193,7 @@ static void ConfigDefaults(GAConfig *c) {
     c->equipBonus   = 1.0f;   /* 默认不改提交分 */
     c->noKillCam    = YES;    /* ★ v0.3.1：默认安全结算 */
     c->equipHook    = NO;     /* ★ v0.3.1：装备钩子默认关 */
+    c->spawnMulti   = NO;     /* ★ v0.3.2：默认只改第一个刷怪器（防 40只/秒 引擎 abort） */
 }
 static int cfgInt(NSDictionary *d, NSString *k, int def) {
     id v = d[k];
@@ -224,6 +226,7 @@ static void ConfigFromDict(GAConfig *c, NSDictionary *d) {
     if (c->equipBonus < 1.0f) c->equipBonus = 1.0f;   /* 加成只能≥1，<1 视为无效 */
     c->noKillCam    = cfgBool(d, @"no_killcam", YES); /* ★ v0.3.1：安全结算 */
     c->equipHook    = cfgBool(d, @"equip_hook", NO);  /* ★ v0.3.1：装备钩子默认关，改后需重启 */
+    c->spawnMulti   = cfgBool(d, @"spawn_multi", NO); /* ★ v0.3.2：默认只改第一个刷怪器 */
     if (c->tickMs < 30) c->tickMs = 30;          /* 太快会压死主线程 */
     if (c->killPerTick < 1) c->killPerTick = 1;
     if (c->spawnLimit < 1) c->spawnLimit = 1;
@@ -243,6 +246,7 @@ static void WriteDefaultConfig(void) {
         @"  \"infinite_ammo\": true,\n"
         @"  \"equip_bonus\": 1.0,\n"
         @"  \"equip_hook\": false,\n"
+        @"  \"spawn_multi\": false,\n"
         @"  \"no_killcam\": true\n"
         @"}\n";
     [body writeToFile:ConfigPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -622,7 +626,8 @@ static void spawnTick(void) {
         int total = cfg.spawnTotal > 0 ? cfg.spawnTotal : 500;
         void *clsList[4] = { K_spawnerH, K_spawnerX, K_spawnerG, K_spawnerG5 };
         void *typeList[4] = { tSpawnerH, tSpawnerX, tSpawnerG, tSpawnerG5 };
-        int hit = 0, foundN = 0, runningN = 0;
+        int hit = 0, foundN = 0, runningN = 0, skipN = 0;
+        const char *hitTag = "-", *skipTag = "-";
         for (int k = 0; k < 4; k++) {
             if (!clsList[k] || !typeList[k]) continue;
             void *r = inv(mFOOAll, NULL, (void *[]){ typeList[k] }, 1);
@@ -637,6 +642,11 @@ static void spawnTick(void) {
                 @try {
                     if (!*(uint8_t *)((char *)s + sp.run)) continue;   /* 只在波次进行中改 */
                     runningN++;
+                    /* ★ v0.3.2：每拍只写**第一个**运行中的刷怪器（spawn_multi=false 默认）。
+                     * 真机铁证：1 个刷怪器@20只/秒 = 连打 4 局稳定；2 个刷怪器各 20 只/秒
+                     * = 全场 40 只/秒，Unity 引擎 4~6 秒内在渲染循环 SIGABRT（崩溃报告
+                     * 逐帧相同，引擎主动 abort，与地图无关）。总怪量=配置值不变。 */
+                    if (!cfg.spawnMulti && hit >= 1) { skipN++; skipTag = sp.tag; continue; }
                     *(float *)((char *)s + SP_TOTAL_MIN) = (float)total;
                     *(float *)((char *)s + SP_TOTAL_MAX) = (float)total;
                     *(float *)((char *)s + SP_ITV_MIN) = itv;
@@ -645,13 +655,15 @@ static void spawnTick(void) {
                     *(float *)((char *)s + sp.cur) = itv;
                     *(int32_t *)((char *)s + sp.left) = total > 1 ? total : 1;
                     hit++;
+                    hitTag = sp.tag;
                 } @catch (NSException *e) {}
             }
         }
         if (hit && !spawnLogged) {
             spawnLogged = YES;
-            TLog(@"[PVE] 刷怪加速生效：%d 只/秒 · 同屏 %d · 总数 %d（命中 %d 个刷怪器）",
-                 cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 0, hit);
+            TLog(@"[PVE] 刷怪加速生效：%d 只/秒 · 同屏 %d · 总数 %d（已改写 %d 个[%s]%s）",
+                 cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 0, hit, hitTag,
+                 skipN > 0 ? @"；其余只改第一个（spawn_multi=false，防引擎 40只/秒 崩溃）" : @"");
         }
         /* ★ 刷怪诊断（10 秒一条）：四段数字能一次定位卡在哪一环
          *   全球行动=0  → ctrlInst() 拿不到（控制器类/方法没找到）⇒ 全部功能哑火
@@ -662,8 +674,9 @@ static void spawnTick(void) {
         long nowD = (long)(CFAbsoluteTimeGetCurrent() * 1000);
         if (nowD - lastSpawnDiag > 10000) {
             lastSpawnDiag = nowD;
-            TLog(@"[PVE] 🔎 刷怪诊断: 全球行动=%d 刷怪器实例=%d 运行中=%d 已改写=%d（spawn=%d rate=%d）",
-                 ctrlInst() ? 1 : 0, foundN, runningN, hit, cfg.spawn ? 1 : 0, cfg.spawnRate);
+            TLog(@"[PVE] 🔎 刷怪诊断: 全球行动=%d 实例=%d 运行中=%d 已改写=%d[%s] 跳过=%d[%s]（spawn=%d rate=%d multi=%d）",
+                 ctrlInst() ? 1 : 0, foundN, runningN, hit, hitTag, skipN, skipTag,
+                 cfg.spawn ? 1 : 0, cfg.spawnRate, cfg.spawnMulti ? 1 : 0);
         }
     } @catch (NSException *e) {}
 }

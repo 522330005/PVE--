@@ -1,8 +1,8 @@
 Package: com.sniper.pvega
 Name: Sniper PVE 全球行动
-Version: 0.3.0
+Version: 0.3.2
 Architecture: iphoneos-arm64
-Description: 自动杀怪 / 分数封顶 / 刷怪加速 / 无限子弹 / 关结算慢动作(不开最后一枪也能结算) / 换局自动作废句柄（防闪退）（参数: Documents/pvega_config.json）
+Description: 自动杀怪 / 分数封顶 / 刷怪加速(只写第一个刷怪器,防引擎崩溃) / 无限子弹 / 安全结算(不开最后一枪也能结算) / 换局自动作废句柄（防闪退）（参数: Documents/pvega_config.json）
 Maintainer: sniper
 Author: sniper
 Section: Tweaks
