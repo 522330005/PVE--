@@ -1,8 +1,8 @@
-Package: com.sniper.pvezb
-Name: Sniper PVE 僵尸噩梦
+Package: com.sniper.pvega
+Name: Sniper PVE 全球行动
 Version: 0.1.0
-Architecture: iphoneos-arm
-Description: 自动杀怪 / 连击注入 / 刷怪加速 / 时长压缩 / 无限子弹（参数: Documents/pvezb_config.json）
+Architecture: iphoneos-arm64
+Description: 自动杀怪 / 分数封顶 / 刷怪加速 / 按住连发保护 / 无限子弹（参数: Documents/pvega_config.json）
 Maintainer: sniper
 Author: sniper
 Section: Tweaks
