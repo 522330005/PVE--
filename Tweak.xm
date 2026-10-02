@@ -2,6 +2,17 @@
  * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.42 模式2 的原生移植）
  * 注入方式：Dopamine 运行时注入（不动磁盘二进制，TNG 已验证的路线）
  *
+ * ★★★ v0.3.3：闪退根因定案 = 双开吞吐超载（配置二分铁证）★★★
+ *   v0.3.1/v0.3.2 在"2 刷怪器关卡"进关 1~2 秒 SIGABRT（.ips 纯引擎帧 UnityRepaint→abort）。
+ *   SSH 热重载配置四轮二分（同一关卡实测）：
+ *     A) auto_kill=0 + spawn=0  → 不崩     B) 只 auto_kill            → 不崩
+ *     C) 只 spawn               → 不崩     D) 双开@20刷+20杀（历史）  → 必崩×4
+ *   ⇒ 不是写入写坏内存，是"刷怪+杀怪"总吞吐超载：2 刷怪器地图天然刷怪多，
+ *     叠加 20只/秒刷 + 20只/秒杀后引擎在渲染循环主动 abort。1 刷怪器小地图撑得住，
+ *     大地图撑不住 —— 与"写几个刷怪器"无关（v0.3.2 只写 1 个照样崩）。
+ *   用户拍板常驻参数（真机稳定）：杀 3个×200ms=15只/秒 · 刷 5只/秒 · 同屏 5 ·
+ *   总数 0(内部500) · 封顶 500。已写入 DEF_* 默认值 + WriteDefaultConfig。
+ *
  * 功能模块（对应 autohead.js 的模式 2 常驻项）：
  *   g  自动杀怪：每 tick_ms 杀 kill_per_tick 个，固定爆头（Person.Kill(true)）
  *       ★ 必须等 _running=1（任务正式开始）才动手 —— 准备阶段的预置怪杀了不算数还扎眼
@@ -71,18 +82,23 @@
 #include <stdlib.h>      /* malloc / calloc */
 #include <sys/stat.h>    /* 配置热重载：stat() 取文件修改时间 */
 
-#define TWEAK_VERSION "0.3.2"
+#define TWEAK_VERSION "0.3.3"
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
 /* ★ 2026-10-01 用户指定：节奏 200ms、每秒杀 20 个、刷怪常年 20 只/秒
  * ★ v0.2.0：「保护段距满分 250 分」随最后一发保护一起删除 */
 #define DEF_TICK_MS        200      /* 杀怪节奏：每 200ms 一拍 → 5 拍/秒 */
-#define DEF_KILL_PER_TICK  4        /* 每拍杀 4 个 ⇒ 5 × 4 = **每秒 20 个**（用户要的目标值） */
-#define DEF_SPAWN_RATE     20       /* 每秒刷 20 只（常驻 20） */
-#define DEF_SPAWN_LIMIT    20       /* 同屏上限（可自设） */
+/* ★ v0.3.3 默认值（2026-10-02 真机二分定案，用户拍板常驻）：
+ *   闪退根因不是某个写入写坏内存，而是"刷怪+杀怪"双开总吞吐超载 —— 2 刷怪器地图
+ *   天然刷怪多，20只/秒刷 + 20只/秒杀叠加后引擎在渲染循环主动 abort（.ips 纯引擎帧）。
+ *   二分铁证：A(全关)不崩 / B(只杀)不崩 / C(只刷)不崩 / 双开@20+20 必崩。
+ *   用户最终参数（稳定+不闪退）：杀 3个×200ms=15只/秒 · 刷 5只/秒 · 同屏 5 · 总数 0 · 封顶 500。 */
+#define DEF_KILL_PER_TICK  3        /* 每拍杀 3 个 ⇒ 5 × 3 = 每秒 15 个 */
+#define DEF_SPAWN_RATE     5        /* 每秒刷 5 只 */
+#define DEF_SPAWN_LIMIT    5        /* 同屏上限 */
 #define DEF_SPAWN_TOTAL    0        /* 0 = 不限（内部用 500） */
-#define DEF_TARGET_POINTS  1000     /* 分数封顶 = 1000（OPS_TARGET_POINTS） */
+#define DEF_TARGET_POINTS  500      /* 分数封顶 = 500 */
 /* ★ v0.2.0：DEF_GUARD_MARGIN / DEF_GUARD_FIRE_MS 已随"最后一发保护"整段删除 */
 
 /* 全球行动控制器 TournamentInGameController */
@@ -237,12 +253,12 @@ static void WriteDefaultConfig(void) {
         @"  \"master\": true,\n"
         @"  \"auto_kill\": true,\n"
         @"  \"tick_ms\": 200,\n"
-        @"  \"kill_per_tick\": 4,\n"
+        @"  \"kill_per_tick\": 3,\n"
         @"  \"spawn\": true,\n"
-        @"  \"spawn_rate\": 20,\n"
-        @"  \"spawn_limit\": 20,\n"
+        @"  \"spawn_rate\": 5,\n"
+        @"  \"spawn_limit\": 5,\n"
         @"  \"spawn_total\": 0,\n"
-        @"  \"target_points\": 1000,\n"
+        @"  \"target_points\": 500,\n"
         @"  \"infinite_ammo\": true,\n"
         @"  \"equip_bonus\": 1.0,\n"
         @"  \"equip_hook\": false,\n"
@@ -662,8 +678,9 @@ static void spawnTick(void) {
         if (hit && !spawnLogged) {
             spawnLogged = YES;
             /* ★ %@ 不是 %s：hitTag 是 C 串用 %s；skipN 提示是 NSString 字面量必须 %@（-Wformat/-Werror） */
+            /* ★ 日志显示实际写入值：spawn_total=0 时内部写 500（此前打"总数 0"误导排查） */
             TLog(@"[PVE] 刷怪加速生效：%d 只/秒 · 同屏 %d · 总数 %d（已改写 %d 个[%s]%@）",
-                 cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 0, hit, hitTag,
+                 cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 500, hit, hitTag,
                  skipN > 0 ? @"；其余只改第一个（spawn_multi=false，防引擎 40只/秒 崩溃）" : @"");
         }
         /* ★ 刷怪诊断（10 秒一条）：四段数字能一次定位卡在哪一环
