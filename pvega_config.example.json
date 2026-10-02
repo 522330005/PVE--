@@ -9,5 +9,6 @@
   "spawn_total": 0,
   "target_points": 1000,
   "infinite_ammo": true,
-  "equip_bonus": 1.0
+  "equip_bonus": 1.0,
+  "no_killcam": true
 }
