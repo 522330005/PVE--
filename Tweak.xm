@@ -653,7 +653,9 @@ static void targetTick(void) {
             long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
             if (now - lastCapMsg > 5000) {
                 lastCapMsg = now;
-                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加%s）", cur, cfg.targetPoints,
+                /* ★ %@ 不是 %s：这里传的是 NSString*（ObjC 对象），写 %s 会被 -Wformat 判为
+                 *   "format specifies type 'char *'" 而 -Werror 直接编译失败（v0.2.0 踩过） */
+                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加%@）", cur, cfg.targetPoints,
                      running ? @"；对局中，被游戏重设会自动再写" : @"；准备阶段，本实例只写一次");
             }
         }
