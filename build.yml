@@ -1,0 +1,117 @@
+# =============================================================
+# GitHub Actions 编译 rootless deb  —  已验证 v5（TNGJB 成功）
+# 用法：放在 tweak 仓库的 .github/workflows/build.yml
+# 触发：push 到 main/master，或 Actions 页手动 Run workflow
+# 产物：Artifacts 里的 packages/*.deb（下载装手机）
+# =============================================================
+
+name: Build Rootless Deb
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (recursive, 拉齐 theos 子模块)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # ⚠️ theos 的 dm.pl 是 vendor 子模块，不 recursive 会 "requires dm.pl"
+
+      # ★ 2026-10-02 加：身份自检。期望值写死在本仓库的 workflow 里，
+      #   手动往 GitHub 传文件时若把两个仓库的 control / Makefile 传反，
+      #   这里会立刻红字失败（而不是默默编出一个对调的 deb）。
+      - name: Verify identity (防 Makefile/control 传错仓库)
+        run: |
+          set -e
+          EXPECT_TWEAK=SniperPVEGA
+          EXPECT_PKG=com.sniper.pvega
+          TWEAK=$(grep -m1 '^TWEAK_NAME' Makefile | awk '{print $3}')
+          PKG=$(grep -m1 '^Package:' control | awk '{print $2}')
+          echo "期望  TWEAK_NAME=$EXPECT_TWEAK   Package=$EXPECT_PKG"
+          echo "实际  TWEAK_NAME=$TWEAK   Package=$PKG"
+          if [ "$TWEAK" != "$EXPECT_TWEAK" ]; then
+            echo "❌ Makefile 不对：本仓库应是 $EXPECT_TWEAK，实际是 $TWEAK"
+            exit 1
+          fi
+          if [ "$PKG" != "$EXPECT_PKG" ]; then
+            echo "❌ control 不对：应是 $EXPECT_PKG，实际是 $PKG"
+            echo "   ← 极可能是把两个仓库的 control 传反了！"
+            exit 1
+          fi
+          if [ ! -f "$TWEAK.plist" ]; then echo "❌ 缺少 $TWEAK.plist"; exit 1; fi
+          if [ ! -f Tweak.xm ]; then echo "❌ 缺少 Tweak.xm"; exit 1; fi
+          echo "✅ 身份自洽：Makefile / control / plist 三者匹配"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot unzip xz-utils perl rsync
+
+      - name: Clone theos (recursive)
+        run: |
+          git clone --depth=1 --recursive https://github.com/theos/theos.git theos
+
+      - name: Install iOS toolchain (L1ghtmann llvm-project, theos 官方同款)
+        run: |
+          # ⚠️ 2026-09 更新：theos-jailed 已改名 llvm-project，旧地址 releases 已空
+          #    theos 要求工具链必须在 $THEOS/toolchain/linux/iphone/bin/clang（写死路径，PATH 没用）
+          #    不同版本的 tar 包根布局不一样（有的根目录就是 bin/，有的带 linux/iphone 前缀）
+          #    ⇒ 解压后自动探测 bin/clang 在哪层，拷到 theos 要的固定位置
+          curl -LO https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+          rm -rf /tmp/tc && mkdir -p /tmp/tc
+          tar -xJf iOSToolchain-x86_64.tar.xz -C /tmp/tc
+          CLANG=$(find /tmp/tc -name clang | head -1)
+          echo "clang found at: $CLANG"
+          TCROOT=$(dirname "$(dirname "$CLANG")")     # bin 的上一层
+          mkdir -p $GITHUB_WORKSPACE/theos/toolchain/linux/iphone
+          cp -a $TCROOT/. $GITHUB_WORKSPACE/theos/toolchain/linux/iphone/
+          $GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/clang --version
+
+      - name: Install SDKs
+        run: |
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mkdir -p $GITHUB_WORKSPACE/theos/sdks
+          cp -r sdks-master/*.sdk $GITHUB_WORKSPACE/theos/sdks/ 2>/dev/null || true
+
+      - name: Build rootless deb
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          echo "THEOS=$THEOS"
+          export THEOS_PACKAGE_SCHEME=rootless
+          make package
+
+      # ★ 2026-10-02 加：产物自检。校验 deb 的 Package 与内部 dylib 名是否匹配，
+      #   这是最后一道关 —— 就算前面全对，这里也能抓出"包里装的不是自己那套代码"。
+      - name: Verify deb (防产物 dylib 与 Package 对调)
+        run: |
+          set -e
+          EXPECT_PKG=com.sniper.pvega
+          EXPECT_DYLIB=SniperPVEGA.dylib
+          DEB=$(ls packages/*.deb | head -1)
+          PKG=$(dpkg-deb -f "$DEB" Package)
+          DYLIB=$(dpkg-deb -c "$DEB" | grep -o '[^/]*\.dylib' | head -1)
+          echo "产物 $DEB"
+          echo "  Package=$PKG    dylib=$DYLIB"
+          if [ "$PKG" != "$EXPECT_PKG" ]; then
+            echo "❌ deb 的 Package 应为 $EXPECT_PKG，实际 $PKG"
+            exit 1
+          fi
+          if [ "$DYLIB" != "$EXPECT_DYLIB" ]; then
+            echo "❌ deb 内的 dylib 应为 $EXPECT_DYLIB，实际 $DYLIB"
+            exit 1
+          fi
+          echo "✅ 产物自洽：Package=$PKG 与 dylib=$DYLIB 匹配"
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SniperPVEGA-deb
+          path: |
+            **/packages/*.deb
+          if-no-files-found: error
