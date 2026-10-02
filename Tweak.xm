@@ -1,5 +1,5 @@
 /* ============================================================================
- * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.41 模式2 的原生移植）
+ * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.42 模式2 的原生移植）
  * 注入方式：Dopamine 运行时注入（不动磁盘二进制，TNG 已验证的路线）
  *
  * 功能模块（对应 autohead.js 的模式 2 常驻项）：
@@ -9,23 +9,29 @@
  *       ⇒ 到分就结算，被游戏重设会自动再写（自愈）
  *   w  刷怪加速：写【通用 TimedSpawner】的 间隔/总数/同屏上限（按类名分派偏移）
  *   ∞  无限子弹：每把枪 currentAmmo 常驻写满 maxAmmo
- *   n  关结算慢动作 ★ v0.3.0：LevelController._showKillCamOnEndLevel(+0x101)=0
- *       ⇒ Win(false) 跳过 KillCam，直接 OnKillCamFinished() 结算
- *       ⇒ 【不用再开最后一枪】，没命中记录也能正常结算上报、不闪退
+ *   n  安全结算 ★ v0.3.1：拦截 LevelController::ShowKillCam（空命中慢动作的唯一入口），
+ *       复刻官方 FakeKillCam：等 CharacterShooter.get_KillDelay 秒 → OnKillCamFinished()
+ *       ⇒ 【不用再开最后一枪】，按游戏自己的"无弹结算"节奏正常结算上报、不闪退
  *   （连击注入已移除：全球行动没有连击加分，僵尸模式才有）
  *   ~~m 最后一发保护~~ ★ v0.2.0 已【整段删除】（同 autohead.js v8.40）—— 最后一发自己开枪
  *
- * ★★★ v0.3.0：关掉结算慢动作（KillCam）★★★
- *   那个"慢动作画面"是 KillCam（子弹镜头）：LevelController::Win(bool showKillCam)
- *   → ShowKillCam() → KillCam::Show(...)。而【结算代码根本不在 Win() 里】，在
- *   OnKillCamFinished() 里，靠 ShowKillCam() 最后一步 `_killCamInstance.Finished += …`
- *   挂上 ⇒ 不出慢动作就永不结算。
- *   为什么"不开最后一枪就闪退"：ShowKillCam 要从 CharacterShooter._hits（本发射击
- *   命中数组）取 target/hitPoint；没开枪 ⇒ _hits.Length==0 ⇒ 0x32b48d4 直接 return
- *   ⇒ 不启动 KillCam、不订阅 Finished ⇒ 本局卡在 Sniping 永不结算 ⇒ 闪退。
- *   修法（1 字节数据补丁）：_showKillCamOnEndLevel 写 0 ⇒ Win(false) 走 else 分支
- *   直接 OnKillCamFinished() 结算。不需要子弹、不需要 _hits、不放慢动作、不闪退。
- *   （详细逆向：D:\sniper_chams\wo\全球行动_KillCam结算链路_全面分析.md）
+ * ★★★ v0.3.1：安全结算（真机日志定案的替代方案）★★★
+ *   v0.3.0 的 1 字节补丁（_showKillCamOnEndLevel=0 ⇒ Win(false) ⇒ else 分支【立即】
+ *   OnKillCamFinished）在真机上仍然闪退。pvega_tweak.log 时间线：自动杀怪 20/秒在
+ *   1~2 秒内清空目标 → 立即结算 → 进程消失（且无 .ips）。对比：JS v8.40 手动开
+ *   最后一枪走原生 KillCam 结算 = 稳定。两个嫌疑：
+ *     X) ReportLevelResult 的 MSHook（v0.3.0 第一次真正被加载，从未验证）；
+ *     Y) 立即结算 —— 官方自己的"无弹结算" FakeKillCam 是【等 get_KillDelay 秒】
+ *        才调 OnKillCamFinished 的（0x32b9768 实证），我们提前了整整一个镜头的时长，
+ *        结算 UI 在死亡动画/布娃娃未清理时就弹出。
+ *   v0.3.1 同时消除两者：
+ *     ① 撤掉 0x101 补丁，改为 MSHook LevelController::ShowKillCam（全二进制唯一
+ *        调用点 = Win+0x63c，零副作用）。替换体复刻 FakeKillCam：读 _player(+0x230)
+ *        的 get_KillDelay → dispatch_after 主线程等同样时长 → runtime_invoke
+ *        OnKillCamFinished → 走原生结算/上报。没开枪也不会再卡死/闪退。
+ *     ② ReportLevelResult 钩子改为配置 equip_hook（默认 false）才安装。
+ *   （v0.3.0 的分析详见 D:\sniper_chams\wo\全球行动_KillCam结算链路_全面分析.md；
+ *     真机定案过程见工作日志 2026-10-02）
  *
  * ★★★ v0.2.0：修复"全球行动玩几把就闪退"（僵尸噩梦 deb 不闪退）★★★
  *   根因 = 换局后继续读写**已释放的 il2cpp 对象**，攒几局把堆写坏。四处：
@@ -65,7 +71,7 @@
 #include <stdlib.h>      /* malloc / calloc */
 #include <sys/stat.h>    /* 配置热重载：stat() 取文件修改时间 */
 
-#define TWEAK_VERSION "0.3.0"
+#define TWEAK_VERSION "0.3.1"
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
@@ -86,14 +92,13 @@
 #define TIC_CAPBONUS    0x50        /* _capBonus */
 #define TIC_USECAP      0x54        /* _useCapBonus（置 0 = 不叠加，封顶就等于 _targetPoints） */
 
-/* ★ v0.3.0：关掉结算慢动作（KillCam）—— LevelController 实例 +0x101
- *   那个"慢动作画面"是 KillCam：LevelController::Win(bool showKillCam) → ShowKillCam()
- *   → KillCam::Show(start,target,hitPoint,killedPerson)，结算却挂在
- *   `_killCamInstance.Finished += OnKillCamFinished` 上（ShowKillCam 最后一步）。
- *   没开枪 ⇒ CharacterShooter._hits 为空 ⇒ ShowKillCam 直接 return ⇒ 永不结算 ⇒ 崩。
- *   写 0 ⇒ Win(false) 跳过 ShowKillCam()，走 else 分支直接 OnKillCamFinished() 结算。
- *   只写在当关 LevelController 实例上（MonoBehaviour，每关新建，关卡销毁自动失效）。 */
-#define LC_OFF_SHOWKILLCAM 0x101    /* _showKillCamOnEndLevel */
+/* ★ v0.3.1：安全结算 —— 那个"慢动作画面"是 KillCam：LevelController::Win(bool)
+ *   → ShowKillCam()（没开枪 ⇒ CharacterShooter._hits 为空 ⇒ 直接 return ⇒ 永不结算）。
+ *   官方自己的无弹结算路径 FakeKillCam 是【等 get_KillDelay 秒再 OnKillCamFinished】
+ *   （0x32b9768 实证），v0.3.0 的 0x101 补丁把结算提前了整整一个镜头的时长，真机闪退。
+ *   ⇒ v0.3.1 改为 MSHook ShowKillCam（全二进制唯一调用点 Win+0x63c），替换体复刻
+ *   FakeKillCam 的节奏，走游戏自己的结算链。 */
+#define LC_PLAYER 0x230    /* LevelController._player（CharacterShooter） */
 /* 开火键屏幕坐标（同 aim.js 实测值） */
 #define FIRE_POS_X      0.125
 #define FIRE_POS_Y      0.81
@@ -170,7 +175,8 @@ typedef struct {
     /* ★ v0.2.0：shotGuard / guardMargin / guardFireMs 已随"最后一发保护"整段删除 */
     BOOL   infiniteAmmo;   /* 无限子弹 */
     float  equipBonus;     /* 装备/联赛得分加成倍数（1.0=不改；2.0=提交分×2；作用于 ReportLevelResult 的 scoreDelta） */
-    BOOL   noKillCam;      /* ★ v0.3.0：关掉结算慢动作（不用开最后一枪也能结算上报） */
+    BOOL   equipHook;      /* ★ v0.3.1：是否安装 ReportLevelResult 钩子（默认关；v0.3.0 该 MSHook 涉嫌结算闪退） */
+    BOOL   noKillCam;      /* ★ v0.3.1：安全结算（拦截 ShowKillCam，复刻 FakeKillCam 延迟结算） */
 } GAConfig;
 static GAConfig cfg;
 
@@ -184,7 +190,8 @@ static void ConfigDefaults(GAConfig *c) {
     c->targetPoints = DEF_TARGET_POINTS;
     c->infiniteAmmo = YES;
     c->equipBonus   = 1.0f;   /* 默认不改提交分 */
-    c->noKillCam    = YES;    /* ★ v0.3.0：默认关掉结算慢动作 */
+    c->noKillCam    = YES;    /* ★ v0.3.1：默认安全结算 */
+    c->equipHook    = NO;     /* ★ v0.3.1：装备钩子默认关 */
 }
 static int cfgInt(NSDictionary *d, NSString *k, int def) {
     id v = d[k];
@@ -215,7 +222,8 @@ static void ConfigFromDict(GAConfig *c, NSDictionary *d) {
     c->infiniteAmmo = cfgBool(d, @"infinite_ammo", YES);
     c->equipBonus   = cfgFloat(d, @"equip_bonus", 1.0f);
     if (c->equipBonus < 1.0f) c->equipBonus = 1.0f;   /* 加成只能≥1，<1 视为无效 */
-    c->noKillCam    = cfgBool(d, @"no_killcam", YES); /* ★ v0.3.0 */
+    c->noKillCam    = cfgBool(d, @"no_killcam", YES); /* ★ v0.3.1：安全结算 */
+    c->equipHook    = cfgBool(d, @"equip_hook", NO);  /* ★ v0.3.1：装备钩子默认关，改后需重启 */
     if (c->tickMs < 30) c->tickMs = 30;          /* 太快会压死主线程 */
     if (c->killPerTick < 1) c->killPerTick = 1;
     if (c->spawnLimit < 1) c->spawnLimit = 1;
@@ -234,6 +242,7 @@ static void WriteDefaultConfig(void) {
         @"  \"target_points\": 1000,\n"
         @"  \"infinite_ammo\": true,\n"
         @"  \"equip_bonus\": 1.0,\n"
+        @"  \"equip_hook\": false,\n"
         @"  \"no_killcam\": true\n"
         @"}\n";
     [body writeToFile:ConfigPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -305,7 +314,9 @@ static void *mReport  = NULL;       /* TournamentClient.ReportLevelResult（对�
 /* ★ v0.3.0：LevelController（关结算慢动作用）。全球行动用的是它的子类
  *   RandomMission.RandomLevelController，get_Instance 拿到的就是当关实例。 */
 static void *K_lc     = NULL;
-static void *mLcInst  = NULL;       /* LevelController.get_Instance */
+static void *mOnKCF   = NULL;       /* ★ v0.3.1 LevelController.OnKillCamFinished（安全结算终点） */
+static void *mShowKC  = NULL;       /* ★ v0.3.1 LevelController.ShowKillCam（挂钩目标，唯一调用点 Win+0x63c） */
+static void *mKillDelay = NULL;     /* ★ v0.3.1 CharacterShooter.get_KillDelay（复刻 FakeKillCam 的等待时长） */
 /* ★ v0.2.0：mShootD / mShootU / mForceD / mForceU 已随"最后一发保护"整段删除（不再碰开火） */
 static void *tPerson = NULL, *tSpawnerH = NULL, *tSpawnerX = NULL, *tSpawnerG = NULL, *tSpawnerG5 = NULL;
 
@@ -392,7 +403,9 @@ static BOOL setupAll(void) {
     mReport    = meth(clsFrom("", "TournamentClient"), "ReportLevelResult", 7);   /* 7 参：(score,head,kill,round,won,weaponId,cb) */
     /* ★ v0.3.0：LevelController（关结算慢动作） */
     K_lc       = clsFrom("", "LevelController");
-    mLcInst    = meth(K_lc, "get_Instance", 0);
+    mOnKCF     = meth(K_lc, "OnKillCamFinished", 0);
+    mShowKC    = meth(K_lc, "ShowKillCam", 0);
+    mKillDelay = meth(K_shooter, "get_KillDelay", 0);
     /* 开火入口已移除（v0.2.0 删除最后一发保护） */
     tPerson    = typeObj(K_person);
     tSpawnerH  = typeObj(K_spawnerH);
@@ -479,14 +492,12 @@ static int  matchId = 0;
 static void *lastMatchInst = NULL;
 static int  lastMatchRun = 0;
 static void *capInstWrote = NULL;      /* 准备阶段已写过封顶的控制器实例（每实例只写一次） */
-static void *lcInstWrote  = NULL;      /* ★ v0.3.0：准备阶段已写过"关慢动作"的 LevelController 实例 */
 static void onNewMatch(const char *why) {
     matchId++;
     killedN = 0;                       /* 击杀去重表（对象池会复用旧地址） */
     shooterInst = NULL; shooterFindAt = 0;
     ctrlDrop();
     capInstWrote = NULL;
-    lcInstWrote  = NULL;               /* ★ v0.3.0 */
     spawnLogged = NO;
     inHallLogged = NO;
     TLog(@"[PVE] 换局#%d（%s）→ 已作废 击杀表/射手/控制器缓存/封顶记录（防野指针）", matchId, why);
@@ -699,41 +710,49 @@ static void targetTick(void) {
     } @catch (NSException *e) {}
 }
 
-/* ═══ ★ v0.3.0 n：关掉结算慢动作（KillCam）══════════════════════════════════
- * 背景（全二进制逆向实证）：全球行动最后一个目标被消灭后，
- *   OnTargetEliminated → DelayedWinEvent 协程 → 读 _showKillCamOnEndLevel(+0x101)
- *   → Win(bool) → ShowKillCam() → KillCam::Show(...)（这就是那个慢动作画面）
- * 而【结算代码不在 Win() 里】，在 OnKillCamFinished() 里，靠 ShowKillCam() 最后一步
- *   `_killCamInstance.Finished += OnKillCamFinished` 挂上 ⇒ KillCam 不跑完就永不结算。
- * 更要命的是：ShowKillCam 要从 CharacterShooter._hits（本发射击命中数组）取 target/hitPoint，
- *   **没开枪 ⇒ _hits.Length==0 ⇒ 0x32b48d4 直接 return** ⇒ 不启动 KillCam、不订阅 Finished
- *   ⇒ 本局卡在 Sniping(1) 永不结算 ⇒ 状态机错乱 / 空引用 ⇒ 闪退。
+/* ═══ ★ v0.3.1 n：安全结算（拦截 ShowKillCam，复刻官方 FakeKillCam）═══════════
+ * v0.3.0 的 1 字节补丁（+0x101=0 ⇒ Win(false) ⇒ else 分支立即 OnKillCamFinished）
+ * 真机仍闪退：自动杀怪 1~2 秒清空目标 → 立即结算 → 进程消失（无 .ips）。
+ * 而官方自己的"无弹结算" FakeKillCam（0x32B5BF8 / MoveNext 0x32B96D0）是：
+ *   帧0: CharacterShooter.ShowFeedbacks(_player) + 读 get_KillDelay(_player) → WaitForSeconds
+ *   帧1: 经 klass+0x338 vtable slot 调 OnKillCamFinished() —— 【隔了整整 KillDelay 秒】。
+ * 我们提前了这一个镜头的时长，结算 UI 在死亡动画未清理时弹出 ⇒ 闪退（嫌疑 Y）；
+ * 另 ReportLevelResult 的 MSHook 从未真机验证过（嫌疑 X，v0.3.1 起改为 equip_hook 默认关）。
  *
- * 修法（1 字节数据补丁，不动一条指令）：把 +0x101 写成 0 ⇒ Win(false) 跳过 ShowKillCam()，
- *   走 else 分支（klass+0x338 的 vtable slot）直接调 OnKillCamFinished() 结算上报。
- *   ⇒ 不需要子弹、不需要命中记录、不放慢动作、不闪退。
- * 作用域：只写在当关 LevelController 实例上（MonoBehaviour，每关新建，关卡销毁自动失效）。 */
-static void killCamOffTick(void) {
-    if (!cfg.noKillCam) return;
-    if (!mLcInst) return;
+ * v0.3.1 做法：MSHook LevelController::ShowKillCam（无参，全二进制唯一调用点 = Win+0x63c，
+ * 子弹镜头走的是 CharacterShooter::ShowKillCam（0x34F6098），互不相干 ⇒ 零副作用）。
+ * 替换体：等 get_KillDelay 秒（缺省 2s，钳 [1,5]）→ 主线程 runtime_invoke
+ * OnKillCamFinished → 之后全部是游戏原生结算/上报链。没开最后一枪也能正常结算。 */
+static void (*orig_ShowKillCam)(void *self) = NULL;
+static void *settleLc = NULL;           /* 防同关重复结算（双保险） */
+static long  settleAt = 0;
+static void my_ShowKillCam(void *self) {
     @try {
-        void *lc = inv(mLcInst, NULL, NULL, 0);
-        if (!lc) return;
-        if (*(uint8_t *)((char *)lc + LC_OFF_SHOWKILLCAM) == 0) return;   /* 已是 0，一个字节都不动 */
-        /* ★ 同 targetTick 的 L5 双门：
-         *   (a) 对局中（_running=1）：对象确定活着 ⇒ 每拍自愈写（被游戏重设会自动再写）
-         *   (b) 非对局中（准备阶段/结算界面/大厅）：**每个实例只写一次**，绝不反复写已释放对象。 */
-        if (!tournamentRunning()) {
-            if (lcInstWrote == lc) return;
-            lcInstWrote = lc;
+        if (!cfg.noKillCam || !gReady || !mOnKCF) {
+            if (orig_ShowKillCam) orig_ShowKillCam(self);   /* 开关关闭 → 原生行为 */
+            return;
         }
-        *(uint8_t *)((char *)lc + LC_OFF_SHOWKILLCAM) = 0;
-        static long lastKcMsg = 0;
         long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-        if (now - lastKcMsg > 5000) {
-            lastKcMsg = now;
-            TLog(@"[PVE] 慢动作: 已写 _showKillCamOnEndLevel=0 → 本局不开最后一枪也能正常结算（无 KillCam）");
-        }
+        if (settleLc == self && now - settleAt < 30000) return;   /* 同一关卡 30 秒内只排一次 */
+        settleLc = self; settleAt = now;
+        float kd = 2.0f;    /* FakeKillCam 用 get_KillDelay(_player)；拿不到就给保守默认值 */
+        @try {
+            void *player = *(void **)((char *)self + LC_PLAYER);
+            if (player && mKillDelay) {
+                void *boxed = inv(mKillDelay, player, NULL, 0);   /* get_KillDelay 返回装箱 float */
+                if (boxed) kd = *(float *)((char *)boxed + 0x10);
+            }
+        } @catch (NSException *e) {}
+        if (kd < 1.0f) kd = 1.0f;
+        if (kd > 5.0f) kd = 5.0f;
+        TLog(@"[PVE] 结算: 已拦截空命中慢动作 → %.1f 秒后安全结算（复刻 FakeKillCam，无 KillCam）", (double)kd);
+        void *lc = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kd * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+                           @try {
+                               if (mOnKCF) inv(mOnKCF, lc, NULL, 0);
+                           } @catch (NSException *e) {}
+                       });
     } @catch (NSException *e) {}
 }
 
@@ -796,11 +815,10 @@ static void frame(void) {
             refillAmmo();
         }
         targetTick();                                                             /* 封顶自愈（内部自带对局门） */
-        killCamOffTick();                                                         /* ★ v0.3.0 关慢动作（自带对局门） */
 
         if (now - lastBeatAt > 10000) {
             lastBeatAt = now;
-            TLog(@"[PVE] 心跳 帧=%ld 全球行动=%d 任务中=%d 累计击杀=%d 刷怪=%d只/秒 封顶=%d 局数=%d 无限子弹=%d 关慢动作=%d",
+            TLog(@"[PVE] 心跳 帧=%ld 全球行动=%d 任务中=%d 累计击杀=%d 刷怪=%d只/秒 封顶=%d 局数=%d 无限子弹=%d 安全结算=%d",
                  frames, inst ? 1 : 0, tournamentRunning() ? 1 : 0, totalKilled,
                  cfg.spawn ? cfg.spawnRate : 0, cfg.targetPoints, matchId, cfg.infiniteAmmo ? 1 : 0,
                  cfg.noKillCam ? 1 : 0);
@@ -904,13 +922,29 @@ static void setupStep(void) {
             retrySetup();
             return;
         }
-        /* ★ 装备加成挂钩：对局结束提交分（ReportLevelResult） */
-        if (mReport && *(void **)mReport) {
-            MSHookFunction(*(void **)mReport, (void *)my_ReportLevelResult, (void **)&orig_ReportLevelResult);
-            if (orig_ReportLevelResult)
-                TLog(@"[PVE] ✅ ReportLevelResult 已挂钩（装备加成 ×%.2f 将作用于提交分）", cfg.equipBonus);
+        /* ★ v0.3.1 安全结算挂钩：LevelController.ShowKillCam（空命中的唯一入口，Win+0x63c） */
+        if (mShowKC && *(void **)mShowKC) {
+            MSHookFunction(*(void **)mShowKC, (void *)my_ShowKillCam, (void **)&orig_ShowKillCam);
+            if (orig_ShowKillCam)
+                TLog(@"[PVE] ✅ ShowKillCam 已挂钩（安全结算：不开最后一枪也能正常结算）");
             else
-                TLog(@"[PVE] ⚠️ ReportLevelResult 挂钩失败（装备加成选项无效，其余功能正常）");
+                TLog(@"[PVE] ⚠️ ShowKillCam 挂钩失败 → 不开最后一枪会卡结算（no_killcam 无效）");
+        } else {
+            TLog(@"[PVE] ⚠️ LevelController.ShowKillCam 未绑定 → 安全结算不可用（no_killcam 无效）");
+        }
+        /* ★ 装备加成挂钩：v0.3.1 起改为 equip_hook 默认关（v0.3.0 的 MSHook 涉嫌结算闪退，
+         *   JS 侧同位置的 Frida attach 已实证无害，Substrate 跳板未验证过 —— 开了再试）。
+         *   改 equip_hook / equip_bonus 后需重启游戏生效。 */
+        if (mReport && *(void **)mReport) {
+            if (cfg.equipHook && cfg.equipBonus > 1.0001f) {
+                MSHookFunction(*(void **)mReport, (void *)my_ReportLevelResult, (void **)&orig_ReportLevelResult);
+                if (orig_ReportLevelResult)
+                    TLog(@"[PVE] ✅ ReportLevelResult 已挂钩（equip_hook=1，装备加成 ×%.2f）", (double)cfg.equipBonus);
+                else
+                    TLog(@"[PVE] ⚠️ ReportLevelResult 挂钩失败（装备加成选项无效，其余功能正常）");
+            } else {
+                TLog(@"[PVE] 装备加成钩子未启用（equip_hook=0 或 equip_bonus=1.0；v0.3.1 默认关闭）");
+            }
         } else {
             TLog(@"[PVE] ⚠️ TournamentClient.ReportLevelResult 未绑定 → 装备加成选项无效");
         }
@@ -918,14 +952,15 @@ static void setupStep(void) {
         TLog(@"[PVE] 🔎 类绑定: Person=%d 射手=%d 全球控制器=%d ｜刷怪器 僵尸=%d 圣诞=%d 通用=%d 500=%d",
              K_person ? 1 : 0, K_shooter ? 1 : 0, K_tic ? 1 : 0,
              K_spawnerH ? 1 : 0, K_spawnerX ? 1 : 0, K_spawnerG ? 1 : 0, K_spawnerG5 ? 1 : 0);
-        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 提交分=%d LevelController单例=%d（开火方法已不再绑定：v0.2.0 删除最后一发保护）",
-             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0, mReport ? 1 : 0, mLcInst ? 1 : 0);
+        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 提交分=%d 安全结算=%d/%d/%d（开火方法已不再绑定：v0.2.0 删除最后一发保护）",
+             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0, mReport ? 1 : 0,
+             mShowKC ? 1 : 0, mOnKCF ? 1 : 0, mKillDelay ? 1 : 0);
         if (!mTicInst) TLog(@"[PVE] ⚠️ 全球行动控制器 get_Instance 未绑定！封顶/杀怪/刷怪 全部会失效（确认 IL2CPP 里 TournamentInGameController 存在且属性 getter 名为 get_Instance）");
-        if (!mLcInst) TLog(@"[PVE] ⚠️ LevelController.get_Instance 未绑定 → 关不了结算慢动作（no_killcam 无效，最后一发仍需你自己开枪）");
+        if (!mShowKC || !mOnKCF) TLog(@"[PVE] ⚠️ ShowKillCam/OnKillCamFinished 未绑定 → 安全结算不可用（no_killcam 无效，最后一发仍需你自己开枪）");
         gTimer = [NSTimer timerWithTimeInterval:1.0 target:[ZBTimerTarget shared] selector:@selector(tick:) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
-        TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜无限子弹=%d｜关慢动作=%d）"
-             @" —— 换局自动作废句柄 · 关结算慢动作（不用开最后一枪）· 日志: Documents/pvega_tweak.log",
+        TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜无限子弹=%d｜安全结算=%d）"
+             @" —— 换局自动作废句柄 · 安全结算（不开最后一枪也能结算）· 日志: Documents/pvega_tweak.log",
              TWEAK_VERSION, cfg.autoKill ? 1 : 0, cfg.tickMs, cfg.killPerTick,
              (double)1000.0 / (double)cfg.tickMs * (double)cfg.killPerTick,
              cfg.spawn ? cfg.spawnRate : 0, cfg.spawnLimit, cfg.spawnTotal,
