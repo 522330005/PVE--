@@ -17,7 +17,7 @@ ifneq ($(PKG_ACTUAL),$(EXPECT_PKG))
 $(error 对调阻断: control 的 Package 是 '$(PKG_ACTUAL)'，但 TWEAK_NAME='SniperPVEGA' 要求 '$(EXPECT_PKG)' —— 极可能是把两个仓库的 control 传反了)
 endif
 ifeq ($(wildcard SniperPVEGA.plist),)
-$(error 缺少 SniperPVEGA.plist（必须与 TWEAK_NAME 同名）)
+$(error 缺少 SniperPVEGA.plist —— 本目录是【全球行动】，TWEAK_NAME=SniperPVEGA。若在"僵尸噩梦"仓库看到此报错，说明把本目录的 Makefile/control 传错仓库了)
 endif
 
 include $(THEOS)/makefiles/common.mk

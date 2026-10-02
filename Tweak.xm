@@ -1,5 +1,5 @@
 /* ============================================================================
- * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.38 模式2 的原生移植）
+ * SniperPVEGA — Sniper3D PVE【全球行动】tweak（autohead.js v8.40 模式2 的原生移植）
  * 注入方式：Dopamine 运行时注入（不动磁盘二进制，TNG 已验证的路线）
  *
  * 功能模块（对应 autohead.js 的模式 2 常驻项）：
@@ -7,11 +7,25 @@
  *       ★ 必须等 _running=1（任务正式开始）才动手 —— 准备阶段的预置怪杀了不算数还扎眼
  *   p  分数封顶：TournamentInGameController._targetPoints 恒定写目标分，并关 capBonus
  *       ⇒ 到分就结算，被游戏重设会自动再写（自愈）
- *   m  最后一发保护：距满分 ≤ guard_margin 分时持续模拟开火键
- *       （实测：满分瞬间若没真实弹道记录，终局 KillCam 空引用会秒退）
  *   w  刷怪加速：写【通用 TimedSpawner】的 间隔/总数/同屏上限（按类名分派偏移）
  *   ∞  无限子弹：每把枪 currentAmmo 常驻写满 maxAmmo
  *   （连击注入已移除：全球行动没有连击加分，僵尸模式才有）
+ *   ~~m 最后一发保护~~ ★ v0.2.0 已【整段删除】（同 autohead.js v8.40）—— 最后一发自己开枪
+ *
+ * ★★★ v0.2.0：修复"全球行动玩几把就闪退"（僵尸噩梦 deb 不闪退）★★★
+ *   根因 = 换局后继续读写**已释放的 il2cpp 对象**，攒几局把堆写坏。四处：
+ *     ① targetTick()  每秒无条件写控制器 +0x54 / +0x28（不检查 _running，对局结束后照写）
+ *     ② spawnTick()   每 500ms 无条件写刷怪器（且不检查 _running）
+ *     ③ refillAmmo()  **每帧**写弹药，而 shooterInst 缓存 5 秒（换局后 60Hz×5s 写死对象）
+ *     ④ ctrlInst()    控制器实例缓存 400ms，跨过换局点就是野指针
+ *   另外 m 那条链本身也是崩源之一（见下"历史包袱"）。
+ *   修复：新增 onNewMatch() 换局生命周期（_running 0→1 / 实例换指针 → 全部作废重抓），
+ *         并给 targetTick / spawnTick / refillAmmo 加上"必须真在对局中"的门。
+ *   历史包袱（说明为什么"按住连发"救不了场，只能删）：
+ *     狙击是"松手开枪"（ShootUp 尾部才 TryNormalShoot），而 v0.1.0 的"保护"是
+ *     【按下就不松手】，等于**一枪都没打出去** —— 终局没有真实弹道记录，
+ *     KillCam 该空引用还是空引用。加上 8Hz 反复调 ShootDown 会把射手状态机搅乱。
+ *     ⇒ 用户拍板：整段删掉，最后一发自己手动开枪。
  *
  * 配置：沙盒 Documents/pvega_config.json（首次运行自动生成，改完 5 秒热重载）
  * 日志：沙盒 Documents/pvega_tweak.log（[LOADED] = 注入成功铁证）
@@ -36,19 +50,19 @@
 #include <stdlib.h>      /* malloc / calloc */
 #include <sys/stat.h>    /* 配置热重载：stat() 取文件修改时间 */
 
-#define TWEAK_VERSION "0.1.0"
+#define TWEAK_VERSION "0.2.0"
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
-/* ★ 2026-10-01 用户指定：节奏 200ms、每秒杀 20 个、刷怪常年 20 只/秒、保护段距满分 250 分 */
+/* ★ 2026-10-01 用户指定：节奏 200ms、每秒杀 20 个、刷怪常年 20 只/秒
+ * ★ v0.2.0：「保护段距满分 250 分」随最后一发保护一起删除 */
 #define DEF_TICK_MS        200      /* 杀怪节奏：每 200ms 一拍 → 5 拍/秒 */
 #define DEF_KILL_PER_TICK  4        /* 每拍杀 4 个 ⇒ 5 × 4 = **每秒 20 个**（用户要的目标值） */
 #define DEF_SPAWN_RATE     20       /* 每秒刷 20 只（常驻 20） */
 #define DEF_SPAWN_LIMIT    20       /* 同屏上限（可自设） */
 #define DEF_SPAWN_TOTAL    0        /* 0 = 不限（内部用 500） */
 #define DEF_TARGET_POINTS  1000     /* 分数封顶 = 1000（OPS_TARGET_POINTS） */
-#define DEF_GUARD_MARGIN   250      /* 距满分还剩 250 分 → 进入保护段 */
-#define DEF_GUARD_FIRE_MS  120      /* 保护段【按住连发】：每 120ms 补一次"按下"（全程不松手） */
+/* ★ v0.2.0：DEF_GUARD_MARGIN / DEF_GUARD_FIRE_MS 已随"最后一发保护"整段删除 */
 
 /* 全球行动控制器 TournamentInGameController */
 #define TIC_RUNNING     0x40        /* _running：StartCounting() 置 1，Finish() 清 0 */
@@ -129,9 +143,7 @@ typedef struct {
     int    spawnLimit;     /* 同屏上限 */
     int    spawnTotal;     /* 总数，0=不限 */
     int    targetPoints;   /* p 分数封顶（0 = 不干预，用游戏原封顶） */
-    BOOL   shotGuard;      /* m 最后一发保护（快满分时持续开火防秒退） */
-    int    guardMargin;    /* 距满分还剩多少分进入保护段 */
-    int    guardFireMs;    /* 保护段内多少毫秒点一次开火键 */
+    /* ★ v0.2.0：shotGuard / guardMargin / guardFireMs 已随"最后一发保护"整段删除 */
     BOOL   infiniteAmmo;   /* 无限子弹 */
     float  equipBonus;     /* 装备/联赛得分加成倍数（1.0=不改；2.0=提交分×2；作用于 ReportLevelResult 的 scoreDelta） */
 } GAConfig;
@@ -145,7 +157,6 @@ static void ConfigDefaults(GAConfig *c) {
     c->autoKill = YES; c->tickMs = DEF_TICK_MS; c->killPerTick = DEF_KILL_PER_TICK;
     c->spawn = YES; c->spawnRate = DEF_SPAWN_RATE; c->spawnLimit = DEF_SPAWN_LIMIT; c->spawnTotal = DEF_SPAWN_TOTAL;
     c->targetPoints = DEF_TARGET_POINTS;
-    c->shotGuard = YES; c->guardMargin = DEF_GUARD_MARGIN; c->guardFireMs = DEF_GUARD_FIRE_MS;
     c->infiniteAmmo = YES;
     c->equipBonus   = 1.0f;   /* 默认不改提交分 */
 }
@@ -174,16 +185,13 @@ static void ConfigFromDict(GAConfig *c, NSDictionary *d) {
     c->spawnLimit   = cfgInt(d, @"spawn_limit", DEF_SPAWN_LIMIT);
     c->spawnTotal   = cfgInt(d, @"spawn_total", DEF_SPAWN_TOTAL);
     c->targetPoints = cfgInt(d, @"target_points", DEF_TARGET_POINTS);
-    c->shotGuard    = cfgBool(d, @"shot_guard", YES);
-    c->guardMargin  = cfgInt(d, @"guard_margin", DEF_GUARD_MARGIN);
-    c->guardFireMs  = cfgInt(d, @"guard_fire_ms", DEF_GUARD_FIRE_MS);
+    /* shot_guard / guard_margin / guard_fire_ms 已删除：json 里留着也会被忽略 */
     c->infiniteAmmo = cfgBool(d, @"infinite_ammo", YES);
     c->equipBonus   = cfgFloat(d, @"equip_bonus", 1.0f);
     if (c->equipBonus < 1.0f) c->equipBonus = 1.0f;   /* 加成只能≥1，<1 视为无效 */
     if (c->tickMs < 30) c->tickMs = 30;          /* 太快会压死主线程 */
     if (c->killPerTick < 1) c->killPerTick = 1;
     if (c->spawnLimit < 1) c->spawnLimit = 1;
-    if (c->guardFireMs < 100) c->guardFireMs = 100;
 }
 static void WriteDefaultConfig(void) {
     NSString *body =
@@ -197,9 +205,6 @@ static void WriteDefaultConfig(void) {
         @"  \"spawn_limit\": 20,\n"
         @"  \"spawn_total\": 0,\n"
         @"  \"target_points\": 1000,\n"
-        @"  \"shot_guard\": true,\n"
-        @"  \"guard_margin\": 250,\n"
-        @"  \"guard_fire_ms\": 120,\n"
         @"  \"infinite_ammo\": true,\n"
         @"  \"equip_bonus\": 1.0\n"
         @"}\n";
@@ -269,8 +274,7 @@ static void *K_spawnerH = NULL, *K_spawnerX = NULL, *K_spawnerG = NULL, *K_spawn
 static void *mFOOAll = NULL, *mKill1 = NULL;   /* 僵尸专属方法已移除（mHallInst/mHallScore/mHallTD） */
 static void *mTicInst = NULL;       /* 全球行动静态单例 get_Instance */
 static void *mReport  = NULL;       /* TournamentClient.ReportLevelResult（对局结束提交分，装备加成挂钩点） */
-/* 开火（最后一发保护用）：走游戏自己的开火路径，换弹/弹药/冷却全部由游戏判断 */
-static void *mShootD = NULL, *mShootU = NULL, *mForceD = NULL, *mForceU = NULL;
+/* ★ v0.2.0：mShootD / mShootU / mForceD / mForceU 已随"最后一发保护"整段删除（不再碰开火） */
 static void *tPerson = NULL, *tSpawnerH = NULL, *tSpawnerX = NULL, *tSpawnerG = NULL, *tSpawnerG5 = NULL;
 
 /* ★ 所有程序集都存下来（不只 Assembly-CSharp）：类的命名空间可能不在 Assembly-CSharp */
@@ -354,11 +358,7 @@ static BOOL setupAll(void) {
     /* 僵尸专属方法不再绑定 */
     mTicInst   = meth(K_tic, "get_Instance", 0);
     mReport    = meth(clsFrom("", "TournamentClient"), "ReportLevelResult", 7);   /* 7 参：(score,head,kill,round,won,weaponId,cb) */
-    /* 开火入口（狙击是"松手开枪"：ShootUp 尾部才 TryNormalShoot ⇒ 必须成对调） */
-    mShootD    = meth(K_shooter, "ShootDown", 0);
-    mShootU    = meth(K_shooter, "ShootUp", 0);
-    mForceD    = meth(K_shooter, "ForceTouchShootDown", 0);
-    mForceU    = meth(K_shooter, "ForceTouchShootUp", 0);
+    /* 开火入口已移除（v0.2.0 删除最后一发保护） */
     tPerson    = typeObj(K_person);
     tSpawnerH  = typeObj(K_spawnerH);
     tSpawnerX  = typeObj(K_spawnerX);
@@ -398,17 +398,20 @@ static BOOL gReady = NO;
 static void *shooterInst = NULL;
 static long shooterFindAt = 0;
 static int  totalKilled = 0;
-static long lastKillAt = 0, lastSpawnAt = 0, lastTimeAt = 0, lastBeatAt = 0;
+static long lastKillAt = 0, lastSpawnAt = 0, lastAmmoAt = 0, lastBeatAt = 0;
 static long frames = 0;
 static BOOL inHallLogged = NO;    /* "进入全球行动关卡"只报一次 */
 static BOOL spawnLogged = NO;     /* "刷怪加速生效"只报一次（别和上面共用同一个标志） */
 /* 注：僵尸专属的 hallInst / 本局人头 / realKills 已全部移除 */
-/* 全球行动控制器（同拍缓存，别每拍都 invoke） */
+/* 全球行动控制器（同拍缓存，别每拍都 invoke）
+ * ★ v0.2.0：缓存从 400ms 砍到 120ms —— 换局时旧控制器会被销毁，400ms 的窗口
+ *   足够让"对局结束那一瞬间"拿到已释放对象再拿去读 _running / 写封顶。 */
 static void *ctrlInstCached = NULL;
 static long ctrlCacheAt = 0;
+static void ctrlDrop(void) { ctrlInstCached = NULL; ctrlCacheAt = 0; }   /* 换局时强制重取 */
 static void *ctrlInst(void) {
     long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-    if (ctrlInstCached && now - ctrlCacheAt < 400) return ctrlInstCached;
+    if (ctrlInstCached && now - ctrlCacheAt < 120) return ctrlInstCached;
     ctrlInstCached = inv(mTicInst, NULL, NULL, 0);
     ctrlCacheAt = now;
     return ctrlInstCached;
@@ -429,6 +432,40 @@ static BOOL killedSeen(void *p) {
 static void killedPush(void *p) {
     if (killedN >= 512) killedN = 0;         /* 满了就整轮重置（相当于换局） */
     killedList[killedN++] = p;
+}
+
+/* ═══ ★ v0.2.0 换局生命周期（防闪退核心）═══════════════════════════════════
+ * 换局时上一局的 il2cpp 对象（控制器 / 射手 / 刷怪器 / Person）全部被销毁，
+ * 而旧代码这些句柄是**跨局复用**的（shooterInst 缓存 5 秒、ctrlInst 400ms、
+ * 刷怪器每次现查但写完就写）—— 于是每局都在往已释放的对象里写，攒几局就把堆写坏
+ * ⇒ 表现就是"全球行动玩几把就闪退"，而僵尸那份因为句柄一直能用所以不闪退。
+ * 这里在「控制器实例换指针」或「_running 0→1」时统一作废，下一局重新抓。 */
+static int  matchId = 0;
+static void *lastMatchInst = NULL;
+static int  lastMatchRun = 0;
+static void *capInstWrote = NULL;      /* 准备阶段已写过封顶的控制器实例（每实例只写一次） */
+static void onNewMatch(const char *why) {
+    matchId++;
+    killedN = 0;                       /* 击杀去重表（对象池会复用旧地址） */
+    shooterInst = NULL; shooterFindAt = 0;
+    ctrlDrop();
+    capInstWrote = NULL;
+    spawnLogged = NO;
+    inHallLogged = NO;
+    TLog(@"[PVE] 换局#%d（%s）→ 已作废 击杀表/射手/控制器缓存/封顶记录（防野指针）", matchId, why);
+}
+static void matchWatch(void) {
+    @try {
+        void *ci = ctrlInst();
+        int run = 0;
+        if (ci) { @try { run = *(uint8_t *)((char *)ci + TIC_RUNNING) ? 1 : 0; } @catch (NSException *e) {} }
+        if (ci && run == 1) {
+            BOOL changed = (lastMatchInst && lastMatchInst != ci);
+            if (lastMatchRun == 0 || changed)
+                onNewMatch(changed ? "控制器换新" : "新对局开始");
+        }
+        lastMatchInst = ci; lastMatchRun = run;
+    } @catch (NSException *e) {}
 }
 static void *findShooter(void) {
     @try {
@@ -528,6 +565,10 @@ static BOOL specOf(void *cls, SpSpec *out) {
 static void spawnTick(void) {
     if (!cfg.spawn || cfg.spawnRate <= 0) return;
     if (!ctrlInst()) return;      /* ★ 只在全球行动关卡动手，别去改别的模式的刷怪器 */
+    /* ★ v0.2.0 防闪退：必须**真在对局中**才写刷怪器。
+     *   旧代码只要 get_Instance 非空就写，对局结束/结算界面/大厅照样 500ms 一次
+     *   往已释放（或下一局还没创建）的 TimedSpawner 里写 7 个字段。 */
+    if (!tournamentRunning()) return;
     @try {
         float itv = 1.0f / (float)cfg.spawnRate;
         int total = cfg.spawnTotal > 0 ? cfg.spawnTotal : 500;
@@ -591,9 +632,19 @@ static void targetTick(void) {
             if (now - tCap > 8000) { tCap = now; TLog(@"[PVE] 🔎 封顶诊断: 控制器实例=空 → 封顶无法写入（get_Instance 未绑定或还没进全球行动关卡）"); }
             return;
         }
-        /* ★ 先无条件关掉 capBonus 叠加 —— 之前是「cur==目标分就跳过」，
-         *   若游戏默认目标分恰好=1000 会整拍跳过、永远不关 capBonus ⇒ 封顶=1000+capBonus≠1000。
-         *   现在每拍都先置 0，封顶必然等于 targetPoints。 */
+        /* ★ v0.2.0 防闪退：分两种情形
+         *   (a) 对局中（_running=1）：对象确定活着 → 每拍自愈写（被游戏重设会自动再写）
+         *   (b) 非对局中（准备阶段/结算界面/大厅）：**每个控制器实例只写一次**。
+         *       旧代码是每秒无条件写，对局结束后控制器已释放还在写 ⇒ 每秒往死对象写 8 字节，
+         *       攒几局把堆写坏 —— 这是"玩几把就闪退"最主要的来源。 */
+        int running = 0;
+        @try { running = *(uint8_t *)((char *)inst + TIC_RUNNING) ? 1 : 0; } @catch (NSException *e) {}
+        if (!running) {
+            if (capInstWrote == inst) return;      /* 本实例已经写过，不再碰 */
+            capInstWrote = inst;
+        }
+        /* ★ 先关掉 capBonus 叠加 —— 之前是「cur==目标分就跳过」，
+         *   若游戏默认目标分恰好=1000 会整拍跳过、永远不关 capBonus ⇒ 封顶=1000+capBonus≠1000。 */
         *(uint8_t *)((char *)inst + TIC_USECAP) = 0;
         int cur = *(int32_t *)((char *)inst + TIC_TARGET);
         if (cur != cfg.targetPoints) {
@@ -602,73 +653,30 @@ static void targetTick(void) {
             long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
             if (now - lastCapMsg > 5000) {
                 lastCapMsg = now;
-                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加；被游戏重设会自动再写）", cur, cfg.targetPoints);
+                TLog(@"[PVE] 封顶: 目标分 %d → %d（已关 capBonus 叠加%s）", cur, cfg.targetPoints,
+                     running ? @"；对局中，被游戏重设会自动再写" : @"；准备阶段，本实例只写一次");
             }
         }
     } @catch (NSException *e) {}
 }
 
-/* ================= m：最后一发保护（快满分 → 持续开火，防终局秒退） =================
- * 诊断结论（2026-09-21 用户 A/B 实测）：满分瞬间若人物全程没有"射击状态"的真实弹道，
- * 终局 KillCam / HighlightKiller 无可回放的开枪记录 → 空引用秒退。
- * ⇒ 距满分 ≤ guard_margin 分时按 guard_fire_ms 的节奏扣扳机（走游戏自己的开火路径）。 */
-/* ★ 2026-10-01 用户要求：保护段改成【按住连发】—— 按下就不松手，由游戏按自己的射速连发。
- *   - 进入保护段：调 ShootDown（按下），**不再调 ShootUp**
- *   - 保持期间：每 guard_fire_ms 补一次 ShootDown（半自动武器靠这个才能连发，自动武器补按也无害）
- *   - 离开保护段 / 对局结束 / 开关关闭：调 ShootUp 松手，保证状态干净
- *   ⚠️ 狙击是"松手开枪"（ShootUp 尾部才 TryNormalShoot），所以离开时必须补一次 ShootUp。 */
-static BOOL guardOn = NO, guardLogged = NO, holding = NO;
-static long lastGuardAt = 0;
-static int  realShots = 0;
-static void pressDown(void) {
-    @try {
-        if (!shooterInst) return;
-        if (mShootD) inv(mShootD, shooterInst, NULL, 0);   /* 正常扳机：按下 */
-        if (mForceD) inv(mForceD, shooterInst, NULL, 0);   /* 双保险 */
-        realShots++;
-    } @catch (NSException *e) {}
-}
-static void releaseUp(void) {
-    @try {
-        if (!shooterInst) return;
-        if (mShootU) inv(mShootU, shooterInst, NULL, 0);   /* 松手 */
-        if (mForceU) inv(mForceU, shooterInst, NULL, 0);
-    } @catch (NSException *e) {}
-}
-static void guardTick(void) {
-    if (!cfg.shotGuard) {
-        if (holding) { releaseUp(); holding = NO; }        /* 关掉开关也要松手 */
-        guardOn = NO;
-        return;
-    }
-    @try {
-        void *inst = ctrlInst();
-        if (!inst || !*(uint8_t *)((char *)inst + TIC_RUNNING)) {
-            if (holding) { releaseUp(); holding = NO; }    /* 对局结束 → 松手 */
-            guardOn = NO;
-            return;
-        }
-        int pts = *(int32_t *)((char *)inst + TIC_POINTS);      /* 实时分（不是右上角 UI） */
-        int eff = *(int32_t *)((char *)inst + TIC_TARGET);      /* 已关 capBonus ⇒ 封顶就是它 */
-        if (pts >= eff - cfg.guardMargin) {
-            guardOn = YES;
-            if (!guardLogged) {
-                guardLogged = YES;
-                TLog(@"[PVE] 持续开火: 进入保护段（%d/%d）→ 【按住连发】每 %dms 补一次按下", pts, eff, cfg.guardFireMs);
-            }
-            long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
-            if (now - lastGuardAt >= cfg.guardFireMs) { lastGuardAt = now; pressDown(); holding = YES; }
-        } else if (guardOn) {
-            guardOn = NO; guardLogged = NO;
-            if (holding) { releaseUp(); holding = NO; }    /* ★ 离开时松手 */
-            TLog(@"[PVE] 持续开火: 离开保护段（新对局/分数回退）→ 已松手");
-        }
-    } @catch (NSException *e) {}
-}
+/* ═══ m：最后一发保护 —— v0.2.0 已【整段删除】════════════════════════════════
+ * 删除原因（用户拍板 + 与 autohead.js v8.40 同步）：
+ *   1) 写法本身就是错的：狙击是"松手开枪"（ShootUp 尾部才 TryNormalShoot），
+ *      而 v0.1.0 的实现是【按下就不松手】⇒ 一枪都没打出去 ⇒ 它想防的终局空引用
+ *      该崩还是崩（用户实测：保护触发了、日志有记录，照样闪退）。
+ *   2) 8Hz 反复调 ShootDown 会把 CharacterShooter 的状态机搅乱（正常玩家不会这么按）。
+ *   3) 它每拍都在读控制器 +0x44/+0x28/+0x40，是又一处跨局野句柄读写。
+ * ⇒ 最后一发交给玩家自己开枪，脚本彻底不碰开火。
+ * （配合上面的换局生命周期 + 对局门，全球行动的闪退源已经全部摘掉。） */
 
 /* ================= 无限子弹 ================= */
 static void refillAmmo(void) {
     if (!cfg.infiniteAmmo) return;
+    /* ★ v0.2.0 防闪退：必须真在对局中才写弹药。
+     *   旧代码是**每帧**写（60Hz），而 shooterInst 缓存 5 秒 ⇒ 换局后最多
+     *   60×5 = 300 次往已释放的射手对象里写弹药，堆写坏得比谁都快。 */
+    if (!tournamentRunning()) return;
     @try {
         if (!shooterInst) return;
         void *list = *(void **)((char *)shooterInst + CS_AMMO_LIST);
@@ -692,16 +700,11 @@ static void frame(void) {
         frames++;
         long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
         if (!gReady) return;
-        /* ★ master 总开关：运行中热改成 false 也要**立刻全部停手** ——
-         *   尤其"按住连发"必须先松手，否则会一直扣着扳机不放（这个 bug 只有热重载才会暴露）。 */
-        if (!cfg.master) {
-            if (holding) { releaseUp(); holding = NO; }
-            guardOn = NO;
-            return;
-        }
+        /* ★ master 总开关：运行中热改成 false 也要立刻全部停手 */
+        if (!cfg.master) return;
 
-        if (!shooterInst || now - shooterFindAt > 5000) { shooterInst = findShooter(); shooterFindAt = now; }
-        refillAmmo();
+        /* ★ v0.2.0：换局探测放最前面（作废跨局句柄） */
+        matchWatch();
 
         void *inst = ctrlInst();
         if (inst && !inHallLogged) {
@@ -710,16 +713,18 @@ static void frame(void) {
         }
         if (now - lastKillAt >= cfg.tickMs)   { lastKillAt = now; killTick(); }
         /* 连击注入已移除 */
-        if (now - lastSpawnAt >= 500)         { lastSpawnAt = now; spawnTick(); }
-        if (now - lastTimeAt >= 1000)         { lastTimeAt = now; targetTick(); }   /* 封顶自愈 */
-        guardTick();                                                              /* 保护段开火 */
+        if (now - lastSpawnAt >= 1000)        { lastSpawnAt = now; spawnTick(); }  /* 500ms→1000ms（减负） */
+        if (now - lastAmmoAt  >= 200)         { lastAmmoAt = now;                  /* 每帧→每200ms */
+            if (!shooterInst || now - shooterFindAt > 5000) { shooterInst = findShooter(); shooterFindAt = now; }
+            refillAmmo();
+        }
+        targetTick();                                                             /* 封顶自愈（内部自带对局门） */
 
         if (now - lastBeatAt > 10000) {
             lastBeatAt = now;
-            TLog(@"[PVE] 心跳 帧=%ld 全球行动=%d 任务中=%d 累计击杀=%d 刷怪=%d只/秒 封顶=%d 保护段=%d(按住中=%d) 触发次数=%d 无限子弹=%d",
+            TLog(@"[PVE] 心跳 帧=%ld 全球行动=%d 任务中=%d 累计击杀=%d 刷怪=%d只/秒 封顶=%d 局数=%d 无限子弹=%d",
                  frames, inst ? 1 : 0, tournamentRunning() ? 1 : 0, totalKilled,
-                 cfg.spawn ? cfg.spawnRate : 0, cfg.targetPoints, guardOn ? 1 : 0,
-                 holding ? 1 : 0, realShots, cfg.infiniteAmmo ? 1 : 0);
+                 cfg.spawn ? cfg.spawnRate : 0, cfg.targetPoints, matchId, cfg.infiniteAmmo ? 1 : 0);
         }
     } @catch (NSException *e) { TLog(@"[PVE] frame 异常: %@", e); }
 }
@@ -775,15 +780,12 @@ static void tick1s(NSTimer *t) {
             }
         }
         if (!gReady) return;
-        if (!cfg.master) {                       /* ★ 同上：master 关了就别写封顶/别刷怪 */
-            if (holding) { releaseUp(); holding = NO; }
-            guardOn = NO;
-            return;
-        }
-        if (!shooterInst) shooterInst = findShooter();
-        refillAmmo();
-        spawnTick();
-        targetTick();
+        if (!cfg.master) return;                 /* master 关了就什么都不做 */
+        /* ★ v0.2.0：1 秒定时器不再重复跑 frame() 里已有的活（旧代码每秒额外再写一遍
+         *   弹药/刷怪器/封顶，等于把写入频率翻倍，也把野指针写入的机会翻倍）。
+         *   这里只做两件事：换局探测 + 未进关卡时维护射手实例。 */
+        matchWatch();
+        if (!ctrlInst()) { if (!shooterInst) shooterInst = findShooter(); }
     } @catch (NSException *e) {}
 }
 @interface ZBTimerTarget : NSObject
@@ -837,18 +839,17 @@ static void setupStep(void) {
         TLog(@"[PVE] 🔎 类绑定: Person=%d 射手=%d 全球控制器=%d ｜刷怪器 僵尸=%d 圣诞=%d 通用=%d 500=%d",
              K_person ? 1 : 0, K_shooter ? 1 : 0, K_tic ? 1 : 0,
              K_spawnerH ? 1 : 0, K_spawnerX ? 1 : 0, K_spawnerG ? 1 : 0, K_spawnerG5 ? 1 : 0);
-        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 开火(ShootDown/Up)=%d/%d ForceTouch=%d/%d",
-             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0,
-             mShootD ? 1 : 0, mShootU ? 1 : 0, mForceD ? 1 : 0, mForceU ? 1 : 0);
+        TLog(@"[PVE] 🔎 方法绑定: 全量查找=%d Kill=%d 全球单例=%d 提交分=%d（开火方法已不再绑定：v0.2.0 删除最后一发保护）",
+             mFOOAll ? 1 : 0, mKill1 ? 1 : 0, mTicInst ? 1 : 0, mReport ? 1 : 0);
         if (!mTicInst) TLog(@"[PVE] ⚠️ 全球行动控制器 get_Instance 未绑定！封顶/杀怪/刷怪 全部会失效（确认 IL2CPP 里 TournamentInGameController 存在且属性 getter 名为 get_Instance）");
         gTimer = [NSTimer timerWithTimeInterval:1.0 target:[ZBTimerTarget shared] selector:@selector(tick:) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
-        TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜保护段=距满分%d分【按住连发】｜无限子弹=%d）"
-             @" —— 日志: Documents/pvega_tweak.log",
+        TLog(@"[PVE] 🎯 SniperPVEGA v%s 就绪（杀怪=%d 每%dms×%d个=每秒%.0f个｜刷怪=%d只/秒 同屏%d 总数%d｜封顶=%d分｜无限子弹=%d）"
+             @" —— 换局自动作废句柄 · 最后一发保护已删除（自己开枪）· 日志: Documents/pvega_tweak.log",
              TWEAK_VERSION, cfg.autoKill ? 1 : 0, cfg.tickMs, cfg.killPerTick,
              (double)1000.0 / (double)cfg.tickMs * (double)cfg.killPerTick,
              cfg.spawn ? cfg.spawnRate : 0, cfg.spawnLimit, cfg.spawnTotal,
-             cfg.targetPoints, cfg.guardMargin, cfg.infiniteAmmo ? 1 : 0);
+             cfg.targetPoints, cfg.infiniteAmmo ? 1 : 0);
     } @catch (NSException *e) { TLog(@"[PVE] 启动异常: %@", e); retrySetup(); }
 }
 

@@ -1,16 +1,13 @@
 {
   "master": true,
   "auto_kill": true,
-  "tick_ms": 300,
-  "kill_per_tick": 5,
-  "streak": false,
+  "tick_ms": 200,
+  "kill_per_tick": 4,
   "spawn": true,
-  "spawn_rate": 13,
+  "spawn_rate": 20,
   "spawn_limit": 20,
   "spawn_total": 0,
   "target_points": 1000,
-  "shot_guard": true,
-  "guard_margin": 150,
-  "guard_fire_ms": 200,
-  "infinite_ammo": true
+  "infinite_ammo": true,
+  "equip_bonus": 1.0
 }
