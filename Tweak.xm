@@ -661,7 +661,8 @@ static void spawnTick(void) {
         }
         if (hit && !spawnLogged) {
             spawnLogged = YES;
-            TLog(@"[PVE] 刷怪加速生效：%d 只/秒 · 同屏 %d · 总数 %d（已改写 %d 个[%s]%s）",
+            /* ★ %@ 不是 %s：hitTag 是 C 串用 %s；skipN 提示是 NSString 字面量必须 %@（-Wformat/-Werror） */
+            TLog(@"[PVE] 刷怪加速生效：%d 只/秒 · 同屏 %d · 总数 %d（已改写 %d 个[%s]%@）",
                  cfg.spawnRate, cfg.spawnLimit, cfg.spawnTotal > 0 ? cfg.spawnTotal : 0, hit, hitTag,
                  skipN > 0 ? @"；其余只改第一个（spawn_multi=false，防引擎 40只/秒 崩溃）" : @"");
         }
