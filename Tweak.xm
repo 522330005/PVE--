@@ -82,7 +82,7 @@
 #include <stdlib.h>      /* malloc / calloc */
 #include <sys/stat.h>    /* 配置热重载：stat() 取文件修改时间 */
 
-#define TWEAK_VERSION "0.3.3"
+#define TWEAK_VERSION "0.4.0"
 #define BUNDLE_SNIPER3D "com.fungames.sniper3d"
 
 /* ★ 默认参数（会被配置覆盖）—— 必须定义在文件头，ConfigDefaults() 要用 */
@@ -759,8 +759,10 @@ static void *settleLc = NULL;           /* 防同关重复结算（双保险） 
 static long  settleAt = 0;
 static void my_ShowKillCam(void *self) {
     @try {
-        if (!cfg.noKillCam || !gReady || !mOnKCF) {
-            if (orig_ShowKillCam) orig_ShowKillCam(self);   /* 开关关闭 → 原生行为 */
+        /* ★ v0.4.0 模式门禁：只在全球行动关卡接管结算；别的模式（含 PVP）一律放行原版 KillCam，
+         *   否则会劫持 PVP/其它模式的击杀镜头与结算链。 */
+        if (!cfg.noKillCam || !gReady || !mOnKCF || !ctrlInst()) {
+            if (orig_ShowKillCam) orig_ShowKillCam(self);   /* 开关关闭 / 不在全球行动 → 原生行为 */
             return;
         }
         long now = (long)(CFAbsoluteTimeGetCurrent() * 1000);
@@ -834,7 +836,18 @@ static void frame(void) {
         matchWatch();
 
         void *inst = ctrlInst();
-        if (inst && !inHallLogged) {
+        /* ★★★ 模式门禁（2026-10-03 用户要求：三份 deb 并存，只在各自模式开功能）：
+         *   TournamentInGameController 实例在 = 真的在全球行动关卡；否则一律待机，
+         *   无限子弹/杀怪/刷怪/封顶 一个都不启用（以前无限子弹在菜单/PVP/僵尸都在补弹）。 */
+        if (!inst) {
+            if (inHallLogged) {
+                inHallLogged = NO;
+                TLog(@"[PVE] 离开全球行动关卡 → 功能待机（无限子弹/杀怪/刷怪/封顶 全部停手；结算钩子也放行原版）");
+            }
+            shooterInst = NULL; shooterFindAt = 0;   /* 清掉跨模式句柄，防野指针 */
+            return;
+        }
+        if (!inHallLogged) {
             inHallLogged = YES;
             TLog(@"[PVE] 进入全球行动关卡 → 常驻功能全部生效");
         }
@@ -874,7 +887,8 @@ static void (*orig_ReportLevelResult)(void *self, int scoreDelta, int headshots,
                                       int roundType, BOOL won, void *weaponId, void *callback);
 static void my_ReportLevelResult(void *self, int scoreDelta, int headshots, int kills,
                                  int roundType, BOOL won, void *weaponId, void *callback) {
-    if (cfg.master && cfg.equipBonus > 1.0001f) {
+    /* ★ v0.4.0 模式门禁：只在全球行动关卡生效（该钩子默认不安装：equip_hook=false） */
+    if (cfg.master && cfg.equipBonus > 1.0001f && ctrlInst()) {
         double f = (double)cfg.equipBonus;
         int sd = (int)((double)scoreDelta * f);
         int k  = (int)((double)kills * f);
@@ -913,7 +927,9 @@ static void tick1s(NSTimer *t) {
          *   弹药/刷怪器/封顶，等于把写入频率翻倍，也把野指针写入的机会翻倍）。
          *   这里只做两件事：换局探测 + 未进关卡时维护射手实例。 */
         matchWatch();
-        if (!ctrlInst()) { if (!shooterInst) shooterInst = findShooter(); }
+        /* ★ v0.4.0 模式门禁：非全球行动模式 → 只维护换局探测与配置热重载，不碰射手/不补弹 */
+        if (!ctrlInst()) { shooterInst = NULL; return; }
+        if (!shooterInst) shooterInst = findShooter();
     } @catch (NSException *e) {}
 }
 @interface ZBTimerTarget : NSObject
